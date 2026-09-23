@@ -1,0 +1,18 @@
+node_modules/
+.next/
+out/
+build/
+
+# secrets — never commit
+.env
+.env.local
+.env*.local
+
+# runtime data
+data/
+*.db
+*.db-journal
+*.db-wal
+
+*.log
+.DS_Store

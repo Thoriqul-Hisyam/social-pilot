@@ -1,0 +1,29 @@
+services:
+  app:
+    build: .
+    container_name: socialpilot
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:3000:3000"   # bind to localhost; put a TLS proxy in front
+    volumes:
+      - socialpilot-data:/app/data
+
+  # Fires the publish queue every 5 minutes. The random 5-30 min gaps live
+  # in each post's scheduled_at, so this tick stays dumb and safe to repeat.
+  worker:
+    image: alpine:3.20
+    container_name: socialpilot-worker
+    restart: unless-stopped
+    depends_on: [app]
+    env_file: .env
+    command: >
+      sh -c "apk add --no-cache curl >/dev/null &&
+             while true; do
+               curl -fsS -X POST http://app:3000/api/worker/tick
+                 -H \"Authorization: Bearer $$API_KEY\" || true;
+               sleep 300;
+             done"
+
+volumes:
+  socialpilot-data:

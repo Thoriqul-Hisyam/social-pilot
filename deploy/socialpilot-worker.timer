@@ -1,0 +1,10 @@
+[Unit]
+Description=Run SocialPilot publish tick every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=socialpilot-worker.service
+
+[Install]
+WantedBy=timers.target

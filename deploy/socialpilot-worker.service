@@ -1,0 +1,7 @@
+[Unit]
+Description=SocialPilot publish tick
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/socialpilot/.env
+ExecStart=/usr/bin/curl -fsS -X POST http://127.0.0.1:3000/api/worker/tick -H "Authorization: Bearer *** 
