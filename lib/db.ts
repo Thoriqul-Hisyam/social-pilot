@@ -20,6 +20,7 @@ export type Post = {
   account_id: number
   caption: string
   image_url: string | null
+  video_url: string | null
   source_url: string | null
   status: PostStatus
   scheduled_at: string
@@ -89,6 +90,7 @@ export function getDb(): DatabaseSync {
   // Keep existing installations compatible with the retry diagnostics.
   try { db.exec('ALTER TABLE posts ADD COLUMN retryable INTEGER NOT NULL DEFAULT 1') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE posts ADD COLUMN claimed_at TEXT') } catch { /* already migrated */ }
+  try { db.exec('ALTER TABLE posts ADD COLUMN video_url TEXT') } catch { /* already migrated */ }
   return db
 }
 
@@ -135,13 +137,14 @@ export function setAccountEnabled(id: number, enabled: boolean) {
 /** Returns the new post id, or null when source_url already queued for this account. */
 export function queuePost(p: {
   account_id: number; caption: string; image_url?: string | null
+  video_url?: string | null
   source_url?: string | null; scheduled_at: string
 }): number | null {
   try {
     const row = getDb().prepare(`
-      INSERT INTO posts (account_id, caption, image_url, source_url, scheduled_at, status)
-      VALUES (?, ?, ?, ?, ?, 'scheduled') RETURNING id
-    `).get(p.account_id, p.caption, p.image_url ?? null, p.source_url ?? null, p.scheduled_at) as { id: number }
+      INSERT INTO posts (account_id, caption, image_url, video_url, source_url, scheduled_at, status)
+      VALUES (?, ?, ?, ?, ?, ?, 'scheduled') RETURNING id
+    `).get(p.account_id, p.caption, p.image_url ?? null, p.video_url ?? null, p.source_url ?? null, p.scheduled_at) as { id: number }
     return row.id
   } catch (e) {
     if (String(e).includes('UNIQUE')) return null   // already queued — expected, not an error
@@ -196,15 +199,16 @@ export function markPublished(id: number, externalIds: string[]) {
 /** Record a post published directly, outside the scheduled queue. */
 export function recordPublishedPost(p: {
   account_id: number; caption: string; image_url?: string | null
+  video_url?: string | null
   source_url?: string | null; external_ids: string[]
 }): number {
   const row = getDb().prepare(`
     INSERT INTO posts
-      (account_id, caption, image_url, source_url, status, scheduled_at, published_at, external_ids)
-    VALUES (?, ?, ?, ?, 'published', datetime('now'), datetime('now'), ?)
+      (account_id, caption, image_url, video_url, source_url, status, scheduled_at, published_at, external_ids)
+    VALUES (?, ?, ?, ?, ?, 'published', datetime('now'), datetime('now'), ?)
     RETURNING id
   `).get(
-    p.account_id, p.caption, p.image_url ?? null, p.source_url ?? null,
+    p.account_id, p.caption, p.image_url ?? null, p.video_url ?? null, p.source_url ?? null,
     JSON.stringify(p.external_ids),
   ) as { id: number }
   return row.id

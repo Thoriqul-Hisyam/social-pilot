@@ -32,6 +32,7 @@ export async function POST(request: NextRequest) {
     const ids = await publishToThreads({
       text: post.caption,
       imageUrl: post.image_url ?? undefined,
+      videoUrl: post.video_url ?? undefined,
       userId: account.external_id,
       token: account.token,
     })
@@ -42,7 +43,7 @@ export async function POST(request: NextRequest) {
     // A broken chain is deleted again, so it can retry from the root. If some parts
     // could not be deleted, fail at once: a retry would repost them. Retry by hand after deleting.
     const stuck = e instanceof ChainBrokenError && e.liveIds.length > 0
-    const retryable = !error.includes('missing Threads credentials') && !error.includes('empty post') && !error.includes('image required')
+    const retryable = !error.includes('missing Threads credentials') && !error.includes('empty post') && !error.includes('image or video required') && !error.includes('not both')
     markFailed(post.id, error, stuck || !retryable ? 1 : 3, retryable)
     return NextResponse.json({ published: false, id: post.id, error, retryable, can_retry: retryable && post.attempts < 3, attempts: post.attempts }, { status: 502 })
   }

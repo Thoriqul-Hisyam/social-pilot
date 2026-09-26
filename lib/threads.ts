@@ -1,7 +1,7 @@
 const API = 'https://graph.threads.net/v1.0'
 const LIMIT = 500
 
-export type PublishInput = { text: string; imageUrl?: string; userId: string; token: string }
+export type PublishInput = { text: string; imageUrl?: string; videoUrl?: string; userId: string; token: string }
 
 /**
  * A reply chain that stopped mid-way. Its published parts were deleted again;
@@ -116,7 +116,8 @@ async function waitForContainer(id: string, token: string, timeoutMs = 60000) {
 
 async function createAndPublish(userId: string, token: string, params: Record<string, string>): Promise<string> {
   const container = await call(`/${userId}/threads`, { ...params, access_token: token })
-  await waitForContainer(container.id, token)
+  // Video transcoding takes far longer than an image fetch.
+  await waitForContainer(container.id, token, params.media_type === 'VIDEO' ? 300000 : 60000)
   const publish = () => call(`/${userId}/threads_publish`, { creation_id: container.id, access_token: token })
   try {
     return (await publish()).id
@@ -145,21 +146,24 @@ export async function deleteThreadsPosts(ids: string[], token: string): Promise<
  * mid-way, the parts already published are deleted so no half thread stays up;
  * a ChainBrokenError names any that could not be deleted.
  */
-export async function publishToThreads({ text, imageUrl, userId, token }: PublishInput): Promise<string[]> {
+export async function publishToThreads({ text, imageUrl, videoUrl, userId, token }: PublishInput): Promise<string[]> {
   if (!userId || !token) throw new Error('missing Threads credentials')
   if (!text.trim()) throw new Error('empty post')
-  // Every post must carry an image; never let one go out as text only.
-  if (!imageUrl) throw new Error('image required')
+  // Every post must carry media; never let one go out as text only.
+  if (!imageUrl && !videoUrl) throw new Error('image or video required')
+  if (imageUrl && videoUrl) throw new Error('pass either imageUrl or videoUrl, not both')
+
+  const media: Record<string, string> = videoUrl
+    ? { media_type: 'VIDEO', video_url: videoUrl }
+    : { media_type: 'IMAGE', image_url: imageUrl! }
 
   const parts = splitForThreads(text)
   const ids: string[] = []
 
   for (let i = 0; i < parts.length; i++) {
-    const withImage = i === 0 && imageUrl
     const params = {
-      media_type: withImage ? 'IMAGE' : 'TEXT',
+      ...(i === 0 ? media : { media_type: 'TEXT' }),
       text: parts[i],
-      ...(withImage ? { image_url: imageUrl! } : {}),
       ...(i > 0 ? { reply_to_id: ids[i - 1] } : {}),
     }
     try {
