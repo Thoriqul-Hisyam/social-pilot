@@ -11,9 +11,12 @@ process.env.SESSION_SECRET = 'another-test-secret-long-enough-for-hmac-sha256!!'
 const { encrypt, decrypt, safeEqual } = await import('../lib/crypto')
 const db = await import('../lib/db')
 
+// Close first: Windows refuses to delete an open SQLite file (EBUSY).
+const cleanup = () => { db.getDb().close(); rmSync(dir, { recursive: true, force: true }) }
+
 let n = 0
 const check = (name: string, cond: boolean) => {
-  if (!cond) { console.error(`FAIL: ${name}`); rmSync(dir, { recursive: true, force: true }); process.exit(1) }
+  if (!cond) { console.error(`FAIL: ${name}`); cleanup(); process.exit(1) }
   n++
 }
 
@@ -79,9 +82,24 @@ check('disabled account hides token', db.getAccountToken(acc) === null)
 db.queuePost({ account_id: acc, caption: 'should not run', scheduled_at: past })
 check('disabled account posts not claimed', db.claimDuePost() === null)
 
+// --- queue tail: a new batch lines up after pending slots, not on top of them ---
+const now = Date.now()
+const gap = 30 * 60_000
+check('toSqlTime matches scheduled_at format', /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(db.toSqlTime(now)))
+// 'x' and 'y' wait at +60 min: more than one gap away, so not part of the train yet
+check('tail stays at now across a long gap', db.queueTail(gap, now) === now)
+db.queuePost({ account_id: acc, caption: 'train 1', scheduled_at: db.toSqlTime(now + 20 * 60_000) })
+db.queuePost({ account_id: acc, caption: 'train 2', scheduled_at: db.toSqlTime(now + 45 * 60_000) })
+const futureMs = Date.parse(`${future.replace(' ', 'T')}Z`)
+check('tail follows the train to its last slot', db.queueTail(gap, now) === futureMs)
+db.queuePost({ account_id: acc, caption: 'parked', scheduled_at: db.toSqlTime(now + 3 * 86_400_000) })
+check('a post parked days ahead does not move the tail', db.queueTail(gap, now) === futureMs)
+const vid = db.queuePost({ account_id: acc, caption: 'video', video_url: 'https://v/1.mp4', scheduled_at: future })!
+check('video post stored', db.listPosts().find(p => p.id === vid)?.video_url === 'https://v/1.mp4')
+
 const s = db.stats()
 check('stats count accounts', s.accounts === 0)
 check('stats count published', s.published === 1)
 
-rmSync(dir, { recursive: true, force: true })
-console.log(`OK — ${n} assertions passed (crypto, accounts, dedup, atomic claim, retry, disabled-account guard)`)
+cleanup()
+console.log(`OK — ${n} assertions passed (crypto, accounts, dedup, atomic claim, retry, disabled-account guard, queue tail)`)

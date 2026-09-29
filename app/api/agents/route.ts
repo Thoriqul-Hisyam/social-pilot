@@ -19,8 +19,3 @@ export async function POST(request: NextRequest) {
   const id = logEvent({ agent: body.agent, message: body.message, to_agent: typeof body.toAgent === 'string' ? body.toAgent : null, kind: typeof body.kind === 'string' ? body.kind : 'info' })
   return NextResponse.json({ id }, { status: 201 })
 }
-
-export const POST_DISABLED = false
-
-// Keep the route intentionally small: the worker/cron will be the writer once each role is wired.
-void POST_DISABLED

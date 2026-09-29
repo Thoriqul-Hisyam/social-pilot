@@ -4,16 +4,18 @@ import type { NextRequest } from 'next/server'
 const PUBLIC = [
   '/login',
   '/api/login',
-  '/api/health',         // uptime probes and container healthchecks
-  '/api/auth/threads',   // OAuth callbacks are called by Meta, not by a logged-in browser
+  '/api/health',                     // uptime probes and container healthchecks
+  '/api/auth/threads/callback',      // browser returns from Meta; the route checks session + OAuth state
+  '/api/auth/threads/deauthorize',   // called server-to-server by Meta
+  '/api/auth/threads/delete',        // called server-to-server by Meta
 ]
 
 /**
- * Everything is private by default. Meta's OAuth/webhook callbacks stay public
- * because Meta cannot carry our session cookie; they are protected by the
- * OAuth code exchange and app secret instead.
+ * Everything is private by default, including starting an OAuth connect.
+ * Meta's server-to-server callbacks stay public because Meta cannot carry our
+ * session cookie; the OAuth callback verifies session and state itself.
  */
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
   if (PUBLIC.some(p => pathname.startsWith(p))) return NextResponse.next()
 

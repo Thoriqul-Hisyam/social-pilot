@@ -152,6 +152,33 @@ export function queuePost(p: {
   }
 }
 
+/** Milliseconds to the 'YYYY-MM-DD HH:MM:SS' UTC form stored in scheduled_at. */
+export function toSqlTime(ms: number): string {
+  return new Date(ms).toISOString().replace('T', ' ').slice(0, 19)
+}
+
+/**
+ * End of the queue train: the last pending slot reachable from now without a
+ * gap longer than maxGapMs. New batches line up after it instead of on top of
+ * it. A lone post parked days ahead is not part of the train, so it cannot
+ * push new batches back to its date.
+ */
+export function queueTail(maxGapMs: number, now = Date.now()): number {
+  const slots = getDb().prepare(`
+    SELECT scheduled_at FROM posts
+    WHERE status IN ('scheduled', 'publishing') AND scheduled_at > ?
+    ORDER BY scheduled_at
+  `).all(toSqlTime(now)) as { scheduled_at: string }[]
+  let tail = now
+  for (const { scheduled_at } of slots) {
+    const t = Date.parse(`${scheduled_at.replace(' ', 'T')}Z`)
+    if (Number.isNaN(t)) continue
+    if (t - tail > maxGapMs) break
+    tail = t
+  }
+  return tail
+}
+
 /** A full 7-part chain with retries finishes well within this; longer means the worker died. */
 const STALE_PUBLISHING_MIN = 20
 

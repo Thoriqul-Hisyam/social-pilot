@@ -69,3 +69,26 @@ export function hasValidApiKey(request: NextRequest): boolean {
 export function unauthorized() {
   return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
 }
+
+// --- Threads OAuth ------------------------------------------------------------
+
+export const OAUTH_STATE_COOKIE = 'sp_oauth_state'
+
+/** The callback's ?state must match the cookie set when this browser started the connect. */
+export function hasValidOAuthState(request: NextRequest): boolean {
+  const expected = request.cookies.get(OAUTH_STATE_COOKIE)?.value
+  const got = request.nextUrl.searchParams.get('state')
+  if (!expected || !got) return false
+  return safeEqual(got, expected)
+}
+
+/** Public https origin of the app: PUBLIC_APP_URL, else the origin of THREADS_REDIRECT_URI. */
+export function publicOrigin(): string | null {
+  const explicit = process.env.PUBLIC_APP_URL?.replace(/\/$/, '')
+  if (explicit) return explicit
+  try {
+    return new URL(process.env.THREADS_REDIRECT_URI ?? '').origin
+  } catch {
+    return null
+  }
+}

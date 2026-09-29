@@ -20,8 +20,18 @@ function record(ip: string) {
   else rec.n++
 }
 
+/**
+ * The client can send any X-Forwarded-For it likes; nginx and Cloudflare only
+ * append the real address at the end. So key on the last hop, never the first.
+ */
+function clientIp(request: NextRequest): string {
+  return request.headers.get('x-forwarded-for')?.split(',').pop()?.trim()
+    || request.headers.get('x-real-ip')?.trim()
+    || 'local'
+}
+
 export async function POST(request: NextRequest) {
-  const ip = request.headers.get('x-forwarded-for')?.split(',')[0].trim() ?? 'local'
+  const ip = clientIp(request)
   if (blocked(ip))
     return NextResponse.json({ error: 'too many attempts, try again later' }, { status: 429 })
 

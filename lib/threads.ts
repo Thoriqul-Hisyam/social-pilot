@@ -16,6 +16,15 @@ export class ChainBrokenError extends Error {
   }
 }
 
+/** An error answer from the Graph API. code is Meta's error code, when it sent one. */
+export class ThreadsApiError extends Error {
+  readonly code?: number
+  constructor(message: string, code?: number) {
+    super(message)
+    this.code = code
+  }
+}
+
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 /** Step name for errors, without the user id: "/123/threads_publish" -> "threads_publish". */
@@ -30,9 +39,26 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
     const err = data?.error ?? {}
     const code = [err.code, err.error_subcode].filter(v => v != null).join('/')
     const msg = err.error_user_msg ?? err.message ?? `HTTP ${res.status}`
-    throw new Error(`Threads API [${step(path)}${code ? ` ${code}` : ''}]: ${msg}`)
+    // Meta support asks for fbtrace_id; code 1 carries no other detail.
+    const trace = err.fbtrace_id ? ` (fbtrace_id ${err.fbtrace_id})` : ''
+    throw new ThreadsApiError(`Threads API [${step(path)}${code ? ` ${code}` : ''}]: ${msg}${trace}`, err.code)
   }
   return data
+}
+
+/** Codes 1 (unknown) and 2 (service) are Meta-side blips that often pass on a retry. */
+const isTransient = (e: unknown) => e instanceof ThreadsApiError && (e.code === 1 || e.code === 2)
+
+async function createContainer(userId: string, token: string, params: Record<string, string>): Promise<string> {
+  for (const wait of [5000, 15000]) {
+    try {
+      return (await call(`/${userId}/threads`, { ...params, access_token: token })).id
+    } catch (e) {
+      if (!isTransient(e)) throw e
+      await sleep(wait)
+    }
+  }
+  return (await call(`/${userId}/threads`, { ...params, access_token: token })).id
 }
 
 /**
@@ -100,6 +126,15 @@ export function splitForThreads(text: string, limit = LIMIT, maxParts = 7): stri
 }
 
 /**
+ * What the composer shows before sending: how many posts the text becomes,
+ * and whether splitForThreads will cut its tail to stay within maxParts.
+ * Pure, so it runs in the browser too.
+ */
+export function threadsPreview(text: string, limit = LIMIT, maxParts = 7): { parts: number; truncated: boolean } {
+  return { parts: splitForThreads(text, limit, maxParts).length, truncated: pack(text, limit).length > maxParts }
+}
+
+/**
  * Waits until a container is ready. Publishing one still IN_PROGRESS fails
  * with "The requested resource does not exist", even for plain text.
  */
@@ -115,10 +150,10 @@ async function waitForContainer(id: string, token: string, timeoutMs = 60000) {
 }
 
 async function createAndPublish(userId: string, token: string, params: Record<string, string>): Promise<string> {
-  const container = await call(`/${userId}/threads`, { ...params, access_token: token })
+  const containerId = await createContainer(userId, token, params)
   // Video transcoding takes far longer than an image fetch.
-  await waitForContainer(container.id, token, params.media_type === 'VIDEO' ? 300000 : 60000)
-  const publish = () => call(`/${userId}/threads_publish`, { creation_id: container.id, access_token: token })
+  await waitForContainer(containerId, token, params.media_type === 'VIDEO' ? 300000 : 60000)
+  const publish = () => call(`/${userId}/threads_publish`, { creation_id: containerId, access_token: token })
   try {
     return (await publish()).id
   } catch {

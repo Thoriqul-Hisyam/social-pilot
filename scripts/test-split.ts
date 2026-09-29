@@ -1,5 +1,5 @@
 /** Self-check for splitForThreads. No network, no publishing. */
-import { splitForThreads } from '../lib/threads'
+import { splitForThreads, threadsPreview } from '../lib/threads'
 
 const L = 500
 let n = 0
@@ -41,5 +41,13 @@ check('giant token chars kept', s3.join('').length === giant.length)
 const exact = 'a'.repeat(L)
 check('exact limit -> 1 part', splitForThreads(exact).length === 1)
 check('limit+1 -> 2 parts', splitForThreads('a'.repeat(L + 1)).length === 2)
+
+// composer preview agrees with the real split and flags a cut tail
+check('preview short', threadsPreview(short).parts === 1 && !threadsPreview(short).truncated)
+check('preview long matches split', threadsPreview(long).parts === parts.length && !threadsPreview(long).truncated)
+const huge = 'Kalimat yang cukup panjang untuk mengisi bagian demi bagian. '.repeat(90)
+check('preview flags truncation', threadsPreview(huge).truncated)
+check('preview never exceeds 7 parts', threadsPreview(huge).parts <= 7 && threadsPreview(huge).parts === splitForThreads(huge).length)
+check('preview empty', threadsPreview('').parts === 1 && !threadsPreview('').truncated)
 
 console.log(`OK — ${n} assertions passed; long sample split into ${parts.length} parts, sizes ${parts.map(p => p.length).join(', ')}`)

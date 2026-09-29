@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { publishToThreads } from "@/lib/threads";
+import { rehostImage } from "@/lib/media";
 import { getAccountToken, listAccounts, recordPublishedPost } from "@/lib/db";
 import { hasValidApiKey, hasValidSession, unauthorized } from "@/lib/auth";
 
@@ -82,7 +83,7 @@ export async function POST(request: NextRequest) {
   try {
     const ids = await publishToThreads({
       text,
-      imageUrl: img ?? undefined,
+      imageUrl: img ? await rehostImage(img) : undefined,
       videoUrl: vid ?? undefined,
       userId: account.external_id,
       token: account.token,
