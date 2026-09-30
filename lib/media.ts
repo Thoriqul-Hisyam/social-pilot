@@ -71,6 +71,12 @@ async function downloadImage(url: string): Promise<{ body: Uint8Array<ArrayBuffe
   }
   const body = Buffer.concat(chunks)
   const kind = sniffImage(body)
+  // cdn.antaranews.com answers a missing file with 200 and an empty body. That is a bad URL or a
+  // CDN hiccup, not a format Threads rejects, so it fails as a (retryable) download error.
+  if ('unsupported' in kind && kind.unsupported === 'not an image') {
+    const got = body.length ? `${body.length} bytes of ${res.headers.get('content-type') ?? 'unknown type'}` : 'an empty body'
+    throw new Error(`image download failed: ${src.hostname} sent ${got}, not an image. Does the file exist? ${url}`)
+  }
   if ('unsupported' in kind) throw new Error(`unsupported image format (${kind.unsupported}) from ${src.hostname}: Threads takes JPEG or PNG only`)
   return { body, ...kind }
 }

@@ -56,7 +56,7 @@ Threads mengunduh gambar sendiri dari `imageUrl`. Banyak CDN berita (misalnya `i
 4. **Bucket → Settings → Object lifecycle rules**: hapus objek berawalan `threads/` setelah 7 hari. Threads hanya mengambil gambar saat post dibuat.
 5. Jangan pasang Bot Fight Mode atau WAF challenge di domain bucket. Kalau terpasang, pengunduh Meta bisa terblokir lagi.
 
-Tanpa lima env `R2_*`, post bergambar langsung gagal dengan `R2 not configured` tanpa dicoba ulang otomatis. Env hanya dibaca saat proses start, jadi setelah mengisinya restart app (`systemctl restart socialpilot`, atau `docker compose up -d` karena `docker compose restart` tidak membaca ulang `env_file`), lalu klik **Proses ulang** di dashboard. Hanya JPEG/PNG maksimal 8 MB yang diterima. WebP, AVIF, dan GIF ditolak dengan pesan yang menyebut formatnya. Video tidak disalin; `videoUrl` tetap diberikan langsung ke Threads.
+Tanpa lima env `R2_*`, post bergambar langsung gagal dengan `R2 not configured` tanpa dicoba ulang otomatis. Env hanya dibaca saat proses start, jadi setelah mengisinya restart app (`systemctl restart socialpilot`, atau `docker compose up -d` karena `docker compose restart` tidak membaca ulang `env_file`), lalu klik **Proses ulang** di dashboard. Hanya JPEG/PNG maksimal 8 MB yang diterima. WebP, AVIF, dan GIF ditolak dengan pesan yang menyebut formatnya. CDN yang menjawab file tidak ada dengan HTTP 200 dan body kosong atau HTML (misalnya `cdn.antaranews.com`) menghasilkan `image download failed … Does the file exist?` beserta URL-nya, dan post itu dicoba ulang otomatis. Video tidak disalin; `videoUrl` tetap diberikan langsung ke Threads.
 
 ### 4. Jalankan
 
@@ -73,6 +73,16 @@ npm ci && npm run build
 sudo cp deploy/socialpilot*.service deploy/socialpilot-worker.timer /etc/systemd/system/
 sudo systemctl enable --now socialpilot socialpilot-worker.timer
 ```
+
+PM2:
+
+```bash
+npm ci && npm run build
+pm2 start scripts/start.mjs --name socialpilot -- --with-worker
+pm2 save
+```
+
+Jangan arahkan PM2 atau process manager lain ke `.next/standalone/server.js`. File itu pindah ke `.next/standalone`, sehingga `.env` dan `.env.local` di root tidak terbaca, dan `DATABASE_PATH` relatif menunjuk ke folder yang dihapus setiap `npm run build`.
 
 Reverse proxy: lihat `deploy/nginx.conf`. Wajib meneruskan `X-Forwarded-For` — rate limit login bergantung padanya.
 
@@ -121,7 +131,7 @@ curl https://domain.com/api/health
 ## Test
 
 ```bash
-npm test            # 60 assertions: crypto, DB, dedup, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
+npm test            # 62 assertions: crypto, DB, dedup, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
 npm run typecheck   # tsc --noEmit
 npm run build       # production build
 ```

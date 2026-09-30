@@ -1,5 +1,7 @@
-/** Self-check for R2 signing and image sniffing. No network, no uploads. */
-import { signV4, sniffImage } from '../lib/media'
+/** Self-check for R2 signing and image sniffing. No uploads; the download check uses a local server. */
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { rehostImage, signV4, sniffImage } from '../lib/media'
 
 let n = 0
 const check = (name: string, cond: boolean) => {
@@ -36,5 +38,15 @@ check('png', (sniffImage(bytes(0x89, 'PNG', 0x0d, 0x0a)) as { ext: string }).ext
 check('webp rejected', (sniffImage(bytes('RIFF', 0, 0, 0, 0, 'WEBP')) as { unsupported: string }).unsupported === 'webp')
 check('avif rejected', (sniffImage(bytes(0, 0, 0, 0x1c, 'ftypavif')) as { unsupported: string }).unsupported === 'avif')
 check('html rejected', (sniffImage(bytes('<!DOCTYPE html>')) as { unsupported: string }).unsupported === 'not an image')
+
+// cdn.antaranews.com answers a missing file with 200 and an empty body: a retryable download
+// failure, not an unsupported format. The fake R2 config is never reached; the download fails first.
+Object.assign(process.env, { R2_ACCOUNT_ID: 'a', R2_ACCESS_KEY_ID: 'b', R2_SECRET_ACCESS_KEY: 'c', R2_BUCKET: 'd', R2_PUBLIC_URL: 'https://e' })
+const server = createServer((_, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end() })
+await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+const missing = `http://127.0.0.1:${(server.address() as AddressInfo).port}/missing.jpg`
+const err = await rehostImage(missing).then(() => '', e => String(e))
+server.close()
+check('empty 200 is a download failure', err.includes('image download failed') && err.includes('an empty body') && err.includes(missing) && !err.includes('unsupported image format'))
 
 console.log(`test-media: ${n} checks passed`)

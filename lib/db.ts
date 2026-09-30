@@ -276,8 +276,8 @@ export function retryPost(id: number): { ok: boolean; reason?: string } {
     { status: PostStatus; retryable: number; error: string | null } | undefined
   if (!post) return { ok: false, reason: 'post not found' }
   if (post.status !== 'failed') return { ok: false, reason: 'post is not failed' }
-  // Older broken chains and setup errors were stored as permanent; they are retryable by hand.
-  if (!post.retryable && !/chain broke|missing Threads credentials|R2 not configured/.test(post.error ?? '')) return { ok: false, reason: 'error is permanent and needs fixing first' }
+  // Older broken chains, setup errors and empty image downloads were stored as permanent; they are retryable by hand.
+  if (!post.retryable && !/chain broke|missing Threads credentials|R2 not configured|\(not an image\)/.test(post.error ?? '')) return { ok: false, reason: 'error is permanent and needs fixing first' }
   getDb().prepare(`
     UPDATE posts SET status = 'scheduled', scheduled_at = datetime('now'), attempts = 0, retryable = 1
     WHERE id = ?
