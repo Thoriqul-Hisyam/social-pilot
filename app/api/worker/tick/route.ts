@@ -46,10 +46,13 @@ export async function POST(request: NextRequest) {
     // A broken chain is deleted again, so it can retry from the root. If some parts
     // could not be deleted, fail at once: a retry would repost them. Retry by hand after deleting.
     const stuck = e instanceof ChainBrokenError && e.liveIds.length > 0
-    const permanent = ['missing Threads credentials', 'empty post', 'image or video required', 'not both', 'R2 not configured', 'unsupported image format', 'image too large']
+    // Setup errors do not pass with time, so fail at once, but keep them retryable by hand for after the fix.
+    const setup = ['missing Threads credentials', 'R2 not configured']
+    const permanent = ['empty post', 'image or video required', 'not both', 'unsupported image format', 'image too large']
     const retryable = !permanent.some(p => error.includes(p))
-    markFailed(post.id, error, stuck || !retryable ? 1 : 3, retryable)
-    const willRetry = retryable && !stuck && post.attempts < 3
+    const needsSetup = setup.some(p => error.includes(p))
+    markFailed(post.id, error, stuck || needsSetup || !retryable ? 1 : 3, retryable)
+    const willRetry = retryable && !stuck && !needsSetup && post.attempts < 3
     logEvent({ agent: 'publisher', to_agent: 'observer', kind: 'error', message: `Post #${post.id} gagal${willRetry ? ', dicoba lagi' : ''}: ${error}`, post_id: post.id })
     return NextResponse.json({ published: false, id: post.id, error, retryable, can_retry: willRetry, attempts: post.attempts }, { status: 502 })
   }

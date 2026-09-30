@@ -76,6 +76,15 @@ check('failure retries first', db.listPosts().find(p => p.id === p2)!.status ===
 for (let i = 0; i < 3; i++) { db.claimDuePost(); db.markFailed(p2, 'boom', 3) }
 check('failure gives up after maxAttempts', db.listPosts().find(p => p.id === p2)!.status === 'failed')
 
+// Rows failed before setup errors became retryable still carry retryable = 0.
+const p3 = db.queuePost({ account_id: acc, caption: 'needs r2', scheduled_at: past })!
+db.claimDuePost()
+db.markFailed(p3, 'Error: R2 not configured: set R2_BUCKET', 1, false)
+check('old setup error can be retried by hand', db.retryPost(p3).ok && db.listPosts().find(p => p.id === p3)!.status === 'scheduled')
+db.claimDuePost()
+db.markFailed(p3, 'Error: unsupported image format (webp)', 1, false)
+check('content error stays permanent', !db.retryPost(p3).ok)
+
 // --- disabled accounts are never published for ---
 db.setAccountEnabled(acc, false)
 check('disabled account hides token', db.getAccountToken(acc) === null)
