@@ -2,13 +2,19 @@ import { getAccountToken, logEvent, postsNeedingInsights, saveMetrics, saveMetri
 import { fetchPostInsights, isInvalidToken, isMissingPermission } from './threads'
 import { pauseForInvalidToken } from './tokens'
 
-/** Posts read per worker tick: 8 × 288 ticks a day covers ~100 new posts read twice daily for a week. */
-const PER_TICK = 8
-const PERMISSION_RETRY_MS = 3_600_000
+/**
+ * Posts read per worker tick. 20 × 288 ticks = 5760 a day: ~100 new posts need
+ * ~2000 (8 reads on day one, 2 a day for the week), and the rest clears the
+ * backlog of never-read history in a few hours after a reconnect.
+ */
+const PER_TICK = 20
+const HOUR_MS = 3_600_000
 
 // Until the account is reconnected with threads_manage_insights, every read fails alike.
 // Wait an hour between tries instead of spending a batch each tick, and say so once.
 let blockedUntil = 0
+// Per-post failures are stored on the post; the crew feed hears of them at most hourly.
+let lastFailureNotice = 0
 
 /**
  * Reads Threads insights for the posts that need them. Runs on each worker tick.
@@ -19,6 +25,7 @@ export async function collectInsights(limit = PER_TICK) {
   let due: ReturnType<typeof postsNeedingInsights>
   try { due = postsNeedingInsights(limit) } catch (e) { console.error(`insights: ${e}`); return }
   const tokens = new Map<number, string | null>()
+  const failed: string[] = []
   for (const p of due) {
     if (!tokens.has(p.account_id)) tokens.set(p.account_id, getAccountToken(p.account_id)?.token ?? null)
     const token = tokens.get(p.account_id)
@@ -27,15 +34,23 @@ export async function collectInsights(limit = PER_TICK) {
       saveMetrics(p.id, await fetchPostInsights(p.media_id, token))
     } catch (e) {
       if (isMissingPermission(e)) {
-        blockedUntil = Date.now() + PERMISSION_RETRY_MS
+        blockedUntil = Date.now() + HOUR_MS
         logEvent({
           agent: 'publisher', to_agent: 'observer', kind: 'error',
-          message: `Insight belum bisa dibaca: izin threads_manage_insights belum diberikan. Tambahkan izinnya di app Meta, lalu hubungkan ulang akun. ${e}`,
+          message: `Insight belum bisa dibaca: token akun belum membawa izin threads_manage_insights. Hubungkan ulang akun (Tambah akun Threads) dan setujui izin insight. ${e}`,
         })
         return
       }
       if (isInvalidToken(e)) { pauseForInvalidToken(p.account_id, e); tokens.set(p.account_id, null); continue }
+      failed.push(`#${p.id}: ${e}`)
       try { saveMetricsError(p.id, String(e)) } catch (e2) { console.error(`insights: post ${p.id}: ${e2}`) }
     }
+  }
+  if (failed.length && Date.now() - lastFailureNotice > HOUR_MS) {
+    lastFailureNotice = Date.now()
+    logEvent({
+      agent: 'publisher', to_agent: 'observer', kind: 'error',
+      message: `Insight ${failed.length} dari ${due.length} post gagal dibaca; dicoba lagi nanti. Contoh ${failed[0]}`,
+    })
   }
 }

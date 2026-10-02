@@ -6,6 +6,7 @@ import { encrypt, decrypt } from './crypto'
 export type Platform = 'threads' | 'facebook'
 export type PostStatus = 'draft' | 'scheduled' | 'publishing' | 'published' | 'failed'
 export type PostKind = 'news' | 'affiliate'
+export const POST_KINDS: readonly PostKind[] = ['news', 'affiliate']
 
 /** Every post must say which it is; nothing is classified by guesswork. */
 export const isPostKind = (v: unknown): v is PostKind => v === 'news' || v === 'affiliate'
@@ -431,9 +432,10 @@ export function stats(kind: PostKind | null = null) {
 
 /**
  * Published posts whose insights to read now, root media id first in external_ids.
- * Never-read posts come first, newest first (this also backfills older history once);
- * then posts of the last 7 days whose reading is over 12 hours old. Later than
- * 7 days the last reading stands. Accounts with a rejected token are skipped.
+ * Never-read posts come first, newest first (this also backfills older history once).
+ * Then stale readings: every 3 hours in a post's first day, while its numbers still
+ * climb, and every 12 hours until it is a week old. After that the last reading stands.
+ * Accounts with a rejected token are skipped.
  */
 export function postsNeedingInsights(limit: number): { id: number; account_id: number; media_id: string }[] {
   return getDb().prepare(`
@@ -442,6 +444,7 @@ export function postsNeedingInsights(limit: number): { id: number; account_id: n
     LEFT JOIN post_metrics m ON m.post_id = p.id
     WHERE p.status = 'published' AND json_extract(p.external_ids, '$[0]') IS NOT NULL
       AND (m.post_id IS NULL
+        OR (p.published_at > datetime('now', '-1 day') AND m.fetched_at < datetime('now', '-3 hours'))
         OR (p.published_at > datetime('now', '-7 days') AND m.fetched_at < datetime('now', '-12 hours')))
     ORDER BY m.post_id IS NOT NULL, p.published_at DESC, p.id DESC
     LIMIT ?
@@ -468,7 +471,7 @@ export function saveMetricsError(postId: number, error: string) {
 }
 
 export type KindSummary = Metrics & {
-  posts: number; covered: number
+  posts: number; covered: number; errors: number
   avg_views: number; avg_likes: number; engagement_rate: number
 }
 export type RankedPost = Metrics & { id: number; kind: PostKind; caption: string; published_at: string }
@@ -476,19 +479,21 @@ export type RankedPost = Metrics & { id: number; kind: PostKind; caption: string
 /**
  * Performance of posts published in the last `days`, per kind (or one kind).
  * covered counts the posts with a reading; averages divide by it, not by posts.
+ * errors counts posts whose latest reading failed.
  * engagement_rate = (likes + replies + reposts + quotes + shares) / views.
+ * top/bottom rank across the kinds asked for; top_by_kind/bottom_by_kind rank each.
  * bottom skips posts under a day old, which have not had their audience yet.
  */
 export function insightsSummary(days: number, kind: PostKind | null = null) {
   const since = `-${days} days`
   const where = "p.status = 'published' AND p.published_at > datetime('now', ?) AND (? IS NULL OR p.kind = ?)"
   const rows = getDb().prepare(`
-    SELECT p.kind, COUNT(*) posts, COUNT(m.views) covered,
+    SELECT p.kind, COUNT(*) posts, COUNT(m.views) covered, COUNT(m.error) errors,
       COALESCE(SUM(m.views), 0) views, COALESCE(SUM(m.likes), 0) likes, COALESCE(SUM(m.replies), 0) replies,
       COALESCE(SUM(m.reposts), 0) reposts, COALESCE(SUM(m.quotes), 0) quotes, COALESCE(SUM(m.shares), 0) shares
     FROM posts p LEFT JOIN post_metrics m ON m.post_id = p.id
     WHERE ${where} GROUP BY p.kind
-  `).all(since, kind, kind) as (Metrics & { kind: PostKind; posts: number; covered: number })[]
+  `).all(since, kind, kind) as (Metrics & { kind: PostKind; posts: number; covered: number; errors: number })[]
   const by_kind: Partial<Record<PostKind, KindSummary>> = {}
   for (const { kind: k, ...r } of rows) {
     const engaged = r.likes + r.replies + r.reposts + r.quotes + r.shares
@@ -499,17 +504,23 @@ export function insightsSummary(days: number, kind: PostKind | null = null) {
       engagement_rate: r.views ? Math.round(engaged / r.views * 10_000) / 10_000 : 0,
     }
   }
-  const ranked = (order: 'ASC' | 'DESC', extra = '') => getDb().prepare(`
+  const ranked = (k: PostKind | null, order: 'ASC' | 'DESC') => getDb().prepare(`
     SELECT p.id, p.kind, substr(p.caption, 1, 120) caption, p.published_at,
       m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares
     FROM posts p JOIN post_metrics m ON m.post_id = p.id
-    WHERE ${where} AND m.views IS NOT NULL ${extra}
+    WHERE ${where} AND m.views IS NOT NULL
+      ${order === 'ASC' ? "AND p.published_at < datetime('now', '-1 day')" : ''}
     ORDER BY m.views ${order}, p.id DESC LIMIT 5
-  `).all(since, kind, kind) as RankedPost[]
+  `).all(since, k, k) as RankedPost[]
+  const perKind = (order: 'ASC' | 'DESC') => Object.fromEntries(
+    POST_KINDS.filter(k => !kind || k === kind).map(k => [k, ranked(k, order)]),
+  ) as Partial<Record<PostKind, RankedPost[]>>
   return {
     days, kind, by_kind,
-    top: ranked('DESC'),
-    bottom: ranked('ASC', "AND p.published_at < datetime('now', '-1 day')"),
+    top: ranked(kind, 'DESC'),
+    bottom: ranked(kind, 'ASC'),
+    top_by_kind: perKind('DESC'),
+    bottom_by_kind: perKind('ASC'),
   }
 }
 
