@@ -7,7 +7,8 @@ Multi-account publishing untuk Threads (Facebook Page menyusul). Next.js + SQLit
 - Dashboard terproteksi password
 - OAuth Threads, token 60 hari, tersimpan terenkripsi AES-256-GCM
 - Composer: teks + gambar atau video, >500 karakter otomatis jadi balasan berantai
-- Antrean dengan jeda acak 5–30 menit setelah slot antrean terakhir, dedup per `source_url`
+- Antrean dengan jeda acak 5–30 menit setelah slot antrean terakhir, dedup per `source_url` untuk berita
+- Jenis post `news` (berita) dan `affiliate`; dashboard bisa difilter per jenis, tiap daftar berhalaman 10 post
 - Worker tick: 1 post per panggilan, retry 3x, klaim atomic
 - REST API untuk otomasi (scraper, cron, n8n)
 
@@ -105,7 +106,7 @@ curl -X POST https://domain.com/api/posts \
   -d '{"items":[{"caption":"...","imageUrl":"https://...","sourceUrl":"https://..."}]}'
 ```
 
-`sourceUrl` yang sama tidak akan diantrekan dua kali. Tiap item butuh tepat satu `imageUrl` atau `videoUrl` (HTTPS publik). `scheduledAt` opsional (ISO, boleh dengan offset seperti `+07:00`; tanpa zona dianggap UTC). Satu item yang tidak valid menolak seluruh batch.
+`kind` opsional: `news` atau `affiliate`. Tanpa `kind`, item dengan `sourceUrl` dianggap `news` dan sisanya `affiliate`. Nilai lain ditolak. `sourceUrl` berita yang sama tidak akan diantrekan dua kali; affiliate boleh berulang. Tiap item butuh tepat satu `imageUrl` atau `videoUrl` (HTTPS publik). `scheduledAt` opsional (ISO, boleh dengan offset seperti `+07:00`; tanpa zona dianggap UTC). Satu item yang tidak valid menolak seluruh batch.
 
 Publish langsung:
 
@@ -113,8 +114,10 @@ Publish langsung:
 curl -X POST https://domain.com/api/publish/threads \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"text":"...","imageUrl":"https://..."}'
+  -d '{"text":"...","imageUrl":"https://...","kind":"news"}'
 ```
+
+`kind` opsional, aturannya sama dengan antrean. Endpoint ini tidak menerima `sourceUrl`, jadi tanpa `kind` post tercatat sebagai `affiliate`.
 
 Tick manual:
 
@@ -131,7 +134,7 @@ curl https://domain.com/api/health
 ## Test
 
 ```bash
-npm test            # 62 assertions: crypto, DB, dedup, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
+npm test            # 75 assertions: crypto, DB, migrasi kind, dedup, paginasi, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
 npm run typecheck   # tsc --noEmit
 npm run build       # production build
 ```

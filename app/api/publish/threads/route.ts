@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { publishToThreads } from "@/lib/threads";
 import { rehostImage } from "@/lib/media";
-import { getAccountToken, listAccounts, recordPublishedPost } from "@/lib/db";
+import { getAccountToken, isPostKind, listAccounts, recordPublishedPost } from "@/lib/db";
 import { hasValidApiKey, hasValidSession, unauthorized } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -17,6 +17,7 @@ export async function POST(request: NextRequest) {
     imageUrl?: unknown;
     videoUrl?: unknown;
     accountId?: unknown;
+    kind?: unknown;
   };
   try {
     body = await request.json();
@@ -24,7 +25,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
 
-  const { text, imageUrl, videoUrl, accountId } = body;
+  const { text, imageUrl, videoUrl, accountId, kind } = body;
   if (typeof text !== "string" || !text.trim())
     return NextResponse.json({ error: "text is required" }, { status: 400 });
   if (text.length > MAX_CAPTION)
@@ -45,6 +46,11 @@ export async function POST(request: NextRequest) {
   if (img && vid)
     return NextResponse.json(
       { error: "pass either imageUrl or videoUrl, not both" },
+      { status: 400 },
+    );
+  if (kind != null && !isPostKind(kind))
+    return NextResponse.json(
+      { error: "kind must be news or affiliate" },
       { status: 400 },
     );
   const media = (img ?? vid)!;
@@ -93,6 +99,7 @@ export async function POST(request: NextRequest) {
       caption: text,
       image_url: img,
       video_url: vid,
+      kind: isPostKind(kind) ? kind : undefined,
       external_ids: ids,
     });
     return NextResponse.json({

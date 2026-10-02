@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { listPosts, listQueue, listPostsByStatus, queuePost, queueTail, stats, listAccounts, toSqlTime } from '@/lib/db'
+import { isPostKind, pagePosts, queuePost, queueTail, stats, listAccounts, toSqlTime } from '@/lib/db'
 import { hasValidApiKey, hasValidSession, unauthorized } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -31,19 +31,34 @@ const scheduledOf = (v: string) => {
   return Number.isNaN(t) ? null : toSqlTime(t)
 }
 
+const MAX_PAGE_SIZE = 100
+
+/**
+ * ?view=queue|failed|history (else all), ?kind=news|affiliate (else both),
+ * ?page from 1 and ?limit up to 100. Stats follow the kind filter.
+ */
 export async function GET(request: NextRequest) {
   if (!hasValidSession(request)) return unauthorized()
-  const view = new URL(request.url).searchParams.get('view')
-  if (view === 'queue') return NextResponse.json({ posts: listQueue(100), stats: stats() })
-  if (view === 'failed') return NextResponse.json({ posts: listPostsByStatus('failed', 100), stats: stats() })
-  if (view === 'history') return NextResponse.json({ posts: listPostsByStatus('published', 100), stats: stats() })
-  return NextResponse.json({ posts: listPosts(100), stats: stats() })
+  const q = new URL(request.url).searchParams
+  const kind = q.get('kind') || null
+  if (kind !== null && !isPostKind(kind))
+    return NextResponse.json({ error: 'kind must be news or affiliate' }, { status: 400 })
+  const view = q.get('view')
+  const limit = Math.min(Math.max(Math.floor(Number(q.get('limit'))) || MAX_PAGE_SIZE, 1), MAX_PAGE_SIZE)
+  const page = Math.max(Math.floor(Number(q.get('page'))) || 1, 1)
+  const { posts, total } = pagePosts(
+    view === 'queue' || view === 'failed' || view === 'history' ? view : 'all',
+    { kind, limit, offset: (page - 1) * limit },
+  )
+  return NextResponse.json({ posts, total, page, limit, stats: stats(kind) })
 }
 
 /**
  * Queue one or many posts. Each item is staggered by a random 5-30 min gap
  * after the latest pending slot, so a batch never fires all at once.
- * Duplicate source_url for the same account is skipped, not an error.
+ * kind is news or affiliate; without it, an item with sourceUrl is news.
+ * Duplicate news sourceUrl for the same account is skipped, not an error;
+ * affiliate may repeat.
  */
 export async function POST(request: NextRequest) {
   if (!hasValidApiKey(request) && !hasValidSession(request)) return unauthorized()
@@ -86,11 +101,15 @@ export async function POST(request: NextRequest) {
     if (pinned && !scheduledAt)
       return NextResponse.json({ error: `scheduledAt is not a valid date: ${pinned}` }, { status: 400 })
 
+    if (it.kind != null && !isPostKind(it.kind))
+      return NextResponse.json({ error: `kind must be news or affiliate, got ${JSON.stringify(it.kind)}` }, { status: 400 })
+
     posts.push({
       account_id: accountId,
       caption,
       ...mediaOf(it)!,
       source_url: typeof it.sourceUrl === 'string' ? it.sourceUrl : null,
+      kind: isPostKind(it.kind) ? it.kind : undefined,
       scheduledAt,
       label: String(it.sourceUrl ?? caption.slice(0, 40)),
     })

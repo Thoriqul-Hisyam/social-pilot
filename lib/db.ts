@@ -5,6 +5,15 @@ import { encrypt, decrypt } from './crypto'
 
 export type Platform = 'threads' | 'facebook'
 export type PostStatus = 'draft' | 'scheduled' | 'publishing' | 'published' | 'failed'
+export type PostKind = 'news' | 'affiliate'
+
+export const isPostKind = (v: unknown): v is PostKind => v === 'news' || v === 'affiliate'
+
+/**
+ * Kind for callers that don't say: news always carries its article URL,
+ * affiliate posts don't. The same rule classified rows from before the column.
+ */
+export const kindFor = (sourceUrl: string | null | undefined): PostKind => sourceUrl ? 'news' : 'affiliate'
 
 export type Account = {
   id: number
@@ -22,6 +31,7 @@ export type Post = {
   image_url: string | null
   video_url: string | null
   source_url: string | null
+  kind: PostKind
   status: PostStatus
   scheduled_at: string
   published_at: string | null
@@ -70,9 +80,6 @@ export function getDb(): DatabaseSync {
       created_at   TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    -- dedup: the same article never queues twice for the same account
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_dedup
-      ON posts (account_id, source_url) WHERE source_url IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_posts_due ON posts (status, scheduled_at);
 
     -- crew activity: every pipeline stage speaks here, addressed to the next agent
@@ -91,6 +98,23 @@ export function getDb(): DatabaseSync {
   try { db.exec('ALTER TABLE posts ADD COLUMN retryable INTEGER NOT NULL DEFAULT 1') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE posts ADD COLUMN claimed_at TEXT') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE posts ADD COLUMN video_url TEXT') } catch { /* already migrated */ }
+  // Column and backfill land together, so a failed upgrade never leaves every row marked news.
+  const cols = db.prepare('PRAGMA table_info(posts)').all() as { name: string }[]
+  if (!cols.some(c => c.name === 'kind')) {
+    db.exec('BEGIN')
+    try {
+      db.exec("ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'news'")
+      db.exec("UPDATE posts SET kind = 'affiliate' WHERE source_url IS NULL")
+      db.exec('COMMIT')
+    } catch (e) { db.exec('ROLLBACK'); throw e }
+  }
+  // dedup: the same article never queues twice for the same account.
+  // Affiliate is exempt on purpose: a product may be posted again.
+  db.exec(`
+    DROP INDEX IF EXISTS idx_posts_dedup;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_dedup_news
+      ON posts (account_id, source_url) WHERE kind = 'news' AND source_url IS NOT NULL;
+  `)
   return db
 }
 
@@ -134,17 +158,20 @@ export function setAccountEnabled(id: number, enabled: boolean) {
 
 // --- posts ------------------------------------------------------------------
 
-/** Returns the new post id, or null when source_url already queued for this account. */
+/** Returns the new post id, or null when this news source_url is already queued for this account. */
 export function queuePost(p: {
   account_id: number; caption: string; image_url?: string | null
   video_url?: string | null
-  source_url?: string | null; scheduled_at: string
+  source_url?: string | null; kind?: PostKind; scheduled_at: string
 }): number | null {
   try {
     const row = getDb().prepare(`
-      INSERT INTO posts (account_id, caption, image_url, video_url, source_url, scheduled_at, status)
-      VALUES (?, ?, ?, ?, ?, ?, 'scheduled') RETURNING id
-    `).get(p.account_id, p.caption, p.image_url ?? null, p.video_url ?? null, p.source_url ?? null, p.scheduled_at) as { id: number }
+      INSERT INTO posts (account_id, caption, image_url, video_url, source_url, kind, scheduled_at, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled') RETURNING id
+    `).get(
+      p.account_id, p.caption, p.image_url ?? null, p.video_url ?? null, p.source_url ?? null,
+      p.kind ?? kindFor(p.source_url), p.scheduled_at,
+    ) as { id: number }
     return row.id
   } catch (e) {
     if (String(e).includes('UNIQUE')) return null   // already queued — expected, not an error
@@ -227,37 +254,44 @@ export function markPublished(id: number, externalIds: string[]) {
 export function recordPublishedPost(p: {
   account_id: number; caption: string; image_url?: string | null
   video_url?: string | null
-  source_url?: string | null; external_ids: string[]
+  source_url?: string | null; kind?: PostKind; external_ids: string[]
 }): number {
   const row = getDb().prepare(`
     INSERT INTO posts
-      (account_id, caption, image_url, video_url, source_url, status, scheduled_at, published_at, external_ids)
-    VALUES (?, ?, ?, ?, ?, 'published', datetime('now'), datetime('now'), ?)
+      (account_id, caption, image_url, video_url, source_url, kind, status, scheduled_at, published_at, external_ids)
+    VALUES (?, ?, ?, ?, ?, ?, 'published', datetime('now'), datetime('now'), ?)
     RETURNING id
   `).get(
     p.account_id, p.caption, p.image_url ?? null, p.video_url ?? null, p.source_url ?? null,
-    JSON.stringify(p.external_ids),
+    p.kind ?? kindFor(p.source_url), JSON.stringify(p.external_ids),
   ) as { id: number }
   return row.id
 }
 
-export function listPostsByStatus(status: PostStatus, limit = 50) {
-  return getDb().prepare(`
-    SELECT p.*, a.username, a.platform FROM posts p
-    JOIN accounts a ON a.id = p.account_id
-    WHERE p.status = ?
-    ORDER BY COALESCE(p.published_at, p.scheduled_at) DESC LIMIT ?
-  `).all(status, limit) as (Post & { username: string; platform: string })[]
+export type PostView = 'queue' | 'failed' | 'history' | 'all'
+type ListedPost = Post & { username: string; platform: string }
+
+// p.id breaks ties, so a page boundary never repeats or skips posts sharing a timestamp.
+const VIEWS: Record<PostView, { where: string; order: string }> = {
+  queue: { where: "p.status IN ('draft', 'scheduled', 'publishing')", order: 'p.scheduled_at ASC, p.id ASC' },
+  failed: { where: "p.status = 'failed'", order: 'COALESCE(p.published_at, p.scheduled_at) DESC, p.id DESC' },
+  history: { where: "p.status = 'published'", order: 'COALESCE(p.published_at, p.scheduled_at) DESC, p.id DESC' },
+  all: { where: '1 = 1', order: 'p.scheduled_at DESC, p.id DESC' },
 }
 
-export function listQueue(limit = 50) {
-  recoverStalePublishing()
-  return getDb().prepare(`
-    SELECT p.*, a.username, a.platform FROM posts p
-    JOIN accounts a ON a.id = p.account_id
-    WHERE p.status IN ('draft', 'scheduled', 'publishing')
-    ORDER BY p.scheduled_at ASC LIMIT ?
-  `).all(limit) as (Post & { username: string; platform: string })[]
+/** One page of a dashboard list, of one kind or (kind null) all, plus the total for paging. */
+export function pagePosts(view: PostView, o: { kind?: PostKind | null; limit?: number; offset?: number } = {}) {
+  if (view === 'queue') recoverStalePublishing()
+  const kind = o.kind ?? null
+  const from = `
+    FROM posts p JOIN accounts a ON a.id = p.account_id
+    WHERE ${VIEWS[view].where} AND (? IS NULL OR p.kind = ?)`
+  const { n } = getDb().prepare(`SELECT COUNT(*) n ${from}`).get(kind, kind) as { n: number }
+  const posts = getDb().prepare(`
+    SELECT p.*, a.username, a.platform ${from}
+    ORDER BY ${VIEWS[view].order} LIMIT ? OFFSET ?
+  `).all(kind, kind, o.limit ?? 50, o.offset ?? 0) as ListedPost[]
+  return { posts, total: n }
 }
 
 /** Failed posts go back to 'scheduled' for retry until MAX_ATTEMPTS. */
@@ -300,18 +334,15 @@ export function deletePost(id: number): { ok: true; post: Post } | { ok: false; 
   return { ok: true, post }
 }
 
-export function listPosts(limit = 50): (Post & { username: string; platform: string })[] {
-  return getDb().prepare(`
-    SELECT p.*, a.username, a.platform FROM posts p
-    JOIN accounts a ON a.id = p.account_id
-    ORDER BY p.scheduled_at DESC LIMIT ?
-  `).all(limit) as (Post & { username: string; platform: string })[]
+export function listPosts(limit = 50): ListedPost[] {
+  return pagePosts('all', { limit }).posts
 }
 
-export function stats() {
+/** Post counts of one kind, or (kind null) all. The account count ignores kind. */
+export function stats(kind: PostKind | null = null) {
   const rows = getDb().prepare(
-    `SELECT status, COUNT(*) n FROM posts GROUP BY status`
-  ).all() as { status: string; n: number }[]
+    `SELECT status, COUNT(*) n FROM posts WHERE ? IS NULL OR kind = ? GROUP BY status`
+  ).all(kind, kind) as { status: string; n: number }[]
   const by = Object.fromEntries(rows.map(r => [r.status, r.n]))
   const accounts = getDb().prepare(
     'SELECT COUNT(*) n FROM accounts WHERE enabled = 1'
