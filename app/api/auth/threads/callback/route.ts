@@ -1,13 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { upsertAccount } from '@/lib/db'
-import { fetchProfile } from '@/lib/threads'
+import { LONG_LIVED_SEC, fetchProfile } from '@/lib/threads'
 import { OAUTH_STATE_COOKIE, hasValidOAuthState, hasValidSession, publicOrigin } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-
-/** Documented lifetime of a long-lived Threads token, used if Meta omits expires_in. */
-const LONG_LIVED_SEC = 60 * 24 * 3600
 
 const fail = (message: string, status = 400) =>
   new NextResponse(message, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })

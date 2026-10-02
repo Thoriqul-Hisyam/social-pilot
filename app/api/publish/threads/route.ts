@@ -48,9 +48,9 @@ export async function POST(request: NextRequest) {
       { error: "pass either imageUrl or videoUrl, not both" },
       { status: 400 },
     );
-  if (kind != null && !isPostKind(kind))
+  if (!isPostKind(kind))
     return NextResponse.json(
-      { error: "kind must be news or affiliate" },
+      { error: "kind is required: \"news\" or \"affiliate\", lowercase" },
       { status: 400 },
     );
   const media = (img ?? vid)!;
@@ -99,7 +99,7 @@ export async function POST(request: NextRequest) {
       caption: text,
       image_url: img,
       video_url: vid,
-      kind: isPostKind(kind) ? kind : undefined,
+      kind,
       external_ids: ids,
     });
     return NextResponse.json({

@@ -5,11 +5,13 @@ Multi-account publishing untuk Threads (Facebook Page menyusul). Next.js + SQLit
 ## Fitur
 
 - Dashboard terproteksi password
-- OAuth Threads, token 60 hari, tersimpan terenkripsi AES-256-GCM
+- OAuth Threads, token 60 hari, tersimpan terenkripsi AES-256-GCM, diperpanjang otomatis sekitar seminggu sekali
 - Composer: teks + gambar atau video, >500 karakter otomatis jadi balasan berantai
 - Antrean dengan jeda acak 5–30 menit setelah slot antrean terakhir, dedup per `source_url` untuk berita
 - Jenis post `news` (berita) dan `affiliate`; dashboard bisa difilter per jenis, tiap daftar berhalaman 10 post
-- Worker tick: 1 post per panggilan, retry 3x, klaim atomic
+- Worker tick: 1 post per panggilan, retry 3x dengan jeda 10 lalu 20 menit, klaim atomic
+- Insight Threads per post (views, likes, replies, reposts, quotes, shares), dibandingkan per jenis di dashboard dan lewat `GET /api/insights`
+- Antrean akun dijeda otomatis kalau Threads menolak tokennya, sampai akun dihubungkan ulang
 - REST API untuk otomasi (scraper, cron, n8n)
 
 ## Deploy
@@ -41,9 +43,9 @@ developers.facebook.com → app → **Threads API → Settings**:
 | Hapus Instalan URL Callback | `https://domain.com/api/auth/threads/deauthorize` |
 | Hapus URL Callback | `https://domain.com/api/auth/threads/delete` |
 
-Permission wajib: `threads_basic`, `threads_content_publish`, `threads_manage_replies`, `threads_delete`.
+Permission wajib: `threads_basic`, `threads_content_publish`, `threads_manage_replies`, `threads_delete`, `threads_manage_insights`.
 
-Tanpa `threads_manage_replies`, post >500 karakter gagal di bagian kedua. Tanpa `threads_delete`, bagian yang sudah tayang dari chain yang putus tidak bisa dihapus otomatis dan harus dihapus manual.
+Tanpa `threads_manage_replies`, post >500 karakter gagal di bagian kedua. Tanpa `threads_delete`, bagian yang sudah tayang dari chain yang putus tidak bisa dihapus otomatis dan harus dihapus manual. Tanpa `threads_manage_insights`, posting tetap jalan tapi kartu Performa kosong dan feed crew menampilkan `Insight belum bisa dibaca` (dicoba lagi tiap jam). Setelah menambah permission, hubungkan ulang akun supaya tokennya membawa izin baru.
 
 Threads menolak HTTP dan IP LAN. Harus domain HTTPS.
 
@@ -103,10 +105,10 @@ Antrekan artikel dari scraper:
 curl -X POST https://domain.com/api/posts \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"items":[{"caption":"...","imageUrl":"https://...","sourceUrl":"https://..."}]}'
+  -d '{"items":[{"caption":"...","imageUrl":"https://...","sourceUrl":"https://...","kind":"news"}]}'
 ```
 
-`kind` opsional: `news` atau `affiliate`. Tanpa `kind`, item dengan `sourceUrl` dianggap `news` dan sisanya `affiliate`. Nilai lain ditolak. `sourceUrl` berita yang sama tidak akan diantrekan dua kali; affiliate boleh berulang. Tiap item butuh tepat satu `imageUrl` atau `videoUrl` (HTTPS publik). `scheduledAt` opsional (ISO, boleh dengan offset seperti `+07:00`; tanpa zona dianggap UTC). Satu item yang tidak valid menolak seluruh batch.
+`kind` wajib di setiap item: `news` (berita, sertakan `sourceUrl` artikelnya) atau `affiliate`, persis huruf kecil. Item tanpa `kind` atau dengan nilai lain menolak seluruh batch (HTTP 400, `items_with_invalid_kind` menyebut nomor itemnya), dan tidak ada yang masuk antrean. `sourceUrl` berita yang sama tidak akan diantrekan dua kali; affiliate boleh berulang. Tiap item butuh tepat satu `imageUrl` atau `videoUrl` (HTTPS publik). `scheduledAt` opsional (ISO, boleh dengan offset seperti `+07:00`; tanpa zona dianggap UTC). Satu item yang tidak valid menolak seluruh batch.
 
 Publish langsung:
 
@@ -117,7 +119,15 @@ curl -X POST https://domain.com/api/publish/threads \
   -d '{"text":"...","imageUrl":"https://...","kind":"news"}'
 ```
 
-`kind` opsional, aturannya sama dengan antrean. Endpoint ini tidak menerima `sourceUrl`, jadi tanpa `kind` post tercatat sebagai `affiliate`.
+`kind` juga wajib di sini, dengan nilai yang sama.
+
+Insight performa (untuk dashboard dan crew):
+
+```bash
+curl "https://domain.com/api/insights?days=7&kind=news" -H "Authorization: Bearer $API_KEY"
+```
+
+`days` 1–90 (default 7), `kind` opsional. Hasilnya per jenis: `posts`, `covered` (post yang sudah terbaca), total `views`/`likes`/`replies`/`reposts`/`quotes`/`shares`, `avg_views`, `avg_likes`, dan `engagement_rate` = (likes + replies + reposts + quotes + shares) / views. Ditambah `top` dan `bottom` (5 post, caption 120 karakter; `bottom` melewati post yang belum berumur sehari). Angka diambil worker tick: 8 post per tick, post baru langsung, lalu tiap 12 jam selama 7 hari. Untuk chain, yang dibaca post akarnya; balasan tidak dijumlahkan Threads.
 
 Tick manual:
 
@@ -134,7 +144,7 @@ curl https://domain.com/api/health
 ## Test
 
 ```bash
-npm test            # 75 assertions: crypto, DB, migrasi kind, dedup, paginasi, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
+npm test            # 109 assertions: crypto, DB, migrasi kind, refresh token, jeda token, insight, dedup, paginasi, jeda retry, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
 npm run typecheck   # tsc --noEmit
 npm run build       # production build
 ```
@@ -144,7 +154,7 @@ Smoke test terhadap server yang sedang jalan (memverifikasi auth, OAuth state, v
 ```bash
 sh scripts/setup-test-env.sh   # generate secret lokal
 npm run dev -- --port 7949 &
-sh scripts/smoke.sh            # 25 pemeriksaan HTTP; SP_TMP=<dir> untuk ganti /tmp
+sh scripts/smoke.sh            # 29 pemeriksaan HTTP; SP_TMP=<dir> untuk ganti /tmp
 ```
 
 `setup-test-env.sh` menimpa `ENCRYPTION_KEY` di `.env.local`, jadi token akun yang tersimpan tidak bisa dibaca lagi. Di mesin yang sudah punya akun terhubung, berikan secret uji dan `DATABASE_PATH` sementara lewat environment variable saja; nilai itu menang atas `.env.local`.
@@ -156,11 +166,10 @@ Catatan: `Dockerfile` dan `docker-compose.yml` belum pernah dieksekusi di mesin 
 - `imageUrl` harus URL publik HTTPS. Path lokal ditolak Threads. Gambar disalin ke R2 sebelum dikirim (lihat langkah 3).
 - Error kode 1/2 dari Threads saat membuat container dicoba ulang dua kali (jeda 5 dan 15 detik). Error Threads menyertakan `fbtrace_id` untuk dilaporkan ke Meta.
 - Batas teks Threads 500 karakter per post; sisanya jadi balasan.
-- Token kedaluwarsa 60 hari. Dashboard menampilkan tanggalnya; connect ulang sebelum lewat.
+- Kalau Threads menolak token (kode 190, misalnya izin dicabut atau password akun diganti), antrean akun itu dijeda: post tidak dihabiskan percobaannya, dashboard menampilkan banner merah, dan antrean jalan lagi begitu akun dihubungkan ulang.
+- Token kedaluwarsa 60 hari. Worker tick memperpanjangnya otomatis begitu sisa masa berlakunya di bawah 53 hari. Kalau gagal, feed crew menampilkan `Token @… gagal diperpanjang` dan dicoba lagi 12 jam kemudian. Dashboard tetap menampilkan tanggal kedaluwarsa; connect ulang kalau perpanjangan terus gagal.
 - Backup: cukup salin file di volume `/app/data`.
 
 ## Belum ada
 
 - Facebook Page publishing (skema DB sudah siap)
-- Refresh token otomatis
-- Analytics engagement

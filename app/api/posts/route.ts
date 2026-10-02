@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { isPostKind, pagePosts, queuePost, queueTail, stats, listAccounts, toSqlTime } from '@/lib/db'
+import { isPostKind, pagePosts, type PostKind, queuePost, queueTail, stats, listAccounts, toSqlTime } from '@/lib/db'
 import { hasValidApiKey, hasValidSession, unauthorized } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -56,7 +56,7 @@ export async function GET(request: NextRequest) {
 /**
  * Queue one or many posts. Each item is staggered by a random 5-30 min gap
  * after the latest pending slot, so a batch never fires all at once.
- * kind is news or affiliate; without it, an item with sourceUrl is news.
+ * Every item needs kind "news" or "affiliate"; one without rejects the batch.
  * Duplicate news sourceUrl for the same account is skipped, not an error;
  * affiliate may repeat.
  */
@@ -74,12 +74,21 @@ export async function POST(request: NextRequest) {
   const enabled = accounts.filter(a => a.enabled)
   const defaultAccount = enabled.length === 1 ? enabled[0].id : null
 
-  // Validate the whole batch up front, so nothing is half-queued and no post slips through without media.
+  // Validate the whole batch up front, so nothing is half-queued and no post slips through without media or kind.
   const noMedia = items.flatMap((raw, i) => mediaOf(raw as Record<string, unknown>) ? [] : [i])
   if (noMedia.length)
     return NextResponse.json({
       error: 'every item needs exactly one public https imageUrl or videoUrl',
       items_without_media: noMedia,
+    }, { status: 400 })
+  const badKind = items.flatMap((raw, i) => {
+    const kind = (raw as Record<string, unknown> | null)?.kind
+    return isPostKind(kind) ? [] : [{ item: i, kind: kind ?? null }]
+  })
+  if (badKind.length)
+    return NextResponse.json({
+      error: 'every item needs kind "news" or "affiliate", lowercase',
+      items_with_invalid_kind: badKind,
     }, { status: 400 })
 
   const posts = []
@@ -101,15 +110,12 @@ export async function POST(request: NextRequest) {
     if (pinned && !scheduledAt)
       return NextResponse.json({ error: `scheduledAt is not a valid date: ${pinned}` }, { status: 400 })
 
-    if (it.kind != null && !isPostKind(it.kind))
-      return NextResponse.json({ error: `kind must be news or affiliate, got ${JSON.stringify(it.kind)}` }, { status: 400 })
-
     posts.push({
       account_id: accountId,
       caption,
       ...mediaOf(it)!,
       source_url: typeof it.sourceUrl === 'string' ? it.sourceUrl : null,
-      kind: isPostKind(it.kind) ? it.kind : undefined,
+      kind: it.kind as PostKind,
       scheduledAt,
       label: String(it.sourceUrl ?? caption.slice(0, 40)),
     })

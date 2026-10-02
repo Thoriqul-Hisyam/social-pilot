@@ -7,13 +7,8 @@ export type Platform = 'threads' | 'facebook'
 export type PostStatus = 'draft' | 'scheduled' | 'publishing' | 'published' | 'failed'
 export type PostKind = 'news' | 'affiliate'
 
+/** Every post must say which it is; nothing is classified by guesswork. */
 export const isPostKind = (v: unknown): v is PostKind => v === 'news' || v === 'affiliate'
-
-/**
- * Kind for callers that don't say: news always carries its article URL,
- * affiliate posts don't. The same rule classified rows from before the column.
- */
-export const kindFor = (sourceUrl: string | null | undefined): PostKind => sourceUrl ? 'news' : 'affiliate'
 
 export type Account = {
   id: number
@@ -21,6 +16,8 @@ export type Account = {
   external_id: string
   username: string
   token_expires_at: string | null
+  /** Set when Threads rejected the token; the account's queue waits until a reconnect or refresh. */
+  token_invalid_at: string | null
   enabled: number
 }
 
@@ -93,11 +90,28 @@ export function getDb(): DatabaseSync {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_events_recent ON agent_events (created_at DESC);
+
+    -- latest Threads insights of a published post's root. NULL metrics = never read;
+    -- error = the last read failed (the metrics from before it stay)
+    CREATE TABLE IF NOT EXISTS post_metrics (
+      post_id    INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,
+      views      INTEGER,
+      likes      INTEGER,
+      replies    INTEGER,
+      reposts    INTEGER,
+      quotes     INTEGER,
+      shares     INTEGER,
+      error      TEXT,
+      fetched_at TEXT NOT NULL
+    );
   `)
   // Keep existing installations compatible with the retry diagnostics.
   try { db.exec('ALTER TABLE posts ADD COLUMN retryable INTEGER NOT NULL DEFAULT 1') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE posts ADD COLUMN claimed_at TEXT') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE posts ADD COLUMN video_url TEXT') } catch { /* already migrated */ }
+  try { db.exec('ALTER TABLE accounts ADD COLUMN token_checked_at TEXT') } catch { /* already migrated */ }
+  try { db.exec('ALTER TABLE accounts ADD COLUMN token_invalid_at TEXT') } catch { /* already migrated */ }
+  // Rows from before the column: news always carried its article URL, affiliate never did.
   // Column and backfill land together, so a failed upgrade never leaves every row marked news.
   const cols = db.prepare('PRAGMA table_info(posts)').all() as { name: string }[]
   if (!cols.some(c => c.name === 'kind')) {
@@ -131,6 +145,8 @@ export function upsertAccount(a: {
       username = excluded.username,
       access_token = excluded.access_token,
       token_expires_at = excluded.token_expires_at,
+      token_invalid_at = NULL,
+      token_checked_at = NULL,
       enabled = 1
     RETURNING id
   `).get(a.platform, a.external_id, a.username, encrypt(a.access_token), a.token_expires_at ?? null) as { id: number }
@@ -139,7 +155,7 @@ export function upsertAccount(a: {
 
 export function listAccounts(): Account[] {
   return getDb().prepare(
-    `SELECT id, platform, external_id, username, token_expires_at, enabled
+    `SELECT id, platform, external_id, username, token_expires_at, token_invalid_at, enabled
      FROM accounts ORDER BY id`
   ).all() as Account[]
 }
@@ -156,13 +172,49 @@ export function setAccountEnabled(id: number, enabled: boolean) {
   getDb().prepare('UPDATE accounts SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id)
 }
 
+/** A token is refreshed once it has under this many days left: about weekly, as a fresh one has 60. */
+export const REFRESH_DAYS_LEFT = 53
+
+/**
+ * Enabled accounts whose token should be refreshed now, decrypted. One that
+ * was tried in the last 12 hours waits, so a failing refresh is not retried every tick.
+ * token_expires_at is ISO ('T', 'Z'), so it is compared through datetime().
+ */
+export function accountsDueForRefresh(): { id: number; username: string; token: string }[] {
+  const rows = getDb().prepare(`
+    SELECT id, username, access_token FROM accounts
+    WHERE enabled = 1 AND token_invalid_at IS NULL
+      AND (token_expires_at IS NULL OR datetime(token_expires_at) < datetime('now', ?))
+      AND (token_checked_at IS NULL OR token_checked_at < datetime('now', '-12 hours'))
+  `).all(`+${REFRESH_DAYS_LEFT} days`) as { id: number; username: string; access_token: string }[]
+  return rows.map(r => ({ id: r.id, username: r.username, token: decrypt(r.access_token) }))
+}
+
+export function markTokenChecked(id: number) {
+  getDb().prepare("UPDATE accounts SET token_checked_at = datetime('now') WHERE id = ?").run(id)
+}
+
+export function updateAccountToken(id: number, token: string, expiresAt: string) {
+  getDb().prepare('UPDATE accounts SET access_token = ?, token_expires_at = ?, token_invalid_at = NULL WHERE id = ?')
+    .run(encrypt(token), expiresAt, id)
+}
+
+/** Pauses the account's queue. Returns its username the first time, null if it was already paused. */
+export function markTokenInvalid(id: number): string | null {
+  const row = getDb().prepare(`
+    UPDATE accounts SET token_invalid_at = datetime('now')
+    WHERE id = ? AND token_invalid_at IS NULL RETURNING username
+  `).get(id) as { username: string } | undefined
+  return row ? row.username || String(id) : null
+}
+
 // --- posts ------------------------------------------------------------------
 
 /** Returns the new post id, or null when this news source_url is already queued for this account. */
 export function queuePost(p: {
   account_id: number; caption: string; image_url?: string | null
   video_url?: string | null
-  source_url?: string | null; kind?: PostKind; scheduled_at: string
+  source_url?: string | null; kind: PostKind; scheduled_at: string
 }): number | null {
   try {
     const row = getDb().prepare(`
@@ -170,7 +222,7 @@ export function queuePost(p: {
       VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled') RETURNING id
     `).get(
       p.account_id, p.caption, p.image_url ?? null, p.video_url ?? null, p.source_url ?? null,
-      p.kind ?? kindFor(p.source_url), p.scheduled_at,
+      p.kind, p.scheduled_at,
     ) as { id: number }
     return row.id
   } catch (e) {
@@ -234,7 +286,7 @@ export function claimDuePost(): Post | null {
     UPDATE posts SET status = 'publishing', attempts = attempts + 1, claimed_at = datetime('now')
     WHERE id = (
       SELECT p.id FROM posts p
-      JOIN accounts a ON a.id = p.account_id AND a.enabled = 1
+      JOIN accounts a ON a.id = p.account_id AND a.enabled = 1 AND a.token_invalid_at IS NULL
       WHERE p.status = 'scheduled' AND p.scheduled_at <= datetime('now')
       ORDER BY p.scheduled_at LIMIT 1
     )
@@ -254,7 +306,7 @@ export function markPublished(id: number, externalIds: string[]) {
 export function recordPublishedPost(p: {
   account_id: number; caption: string; image_url?: string | null
   video_url?: string | null
-  source_url?: string | null; kind?: PostKind; external_ids: string[]
+  source_url?: string | null; kind: PostKind; external_ids: string[]
 }): number {
   const row = getDb().prepare(`
     INSERT INTO posts
@@ -263,13 +315,14 @@ export function recordPublishedPost(p: {
     RETURNING id
   `).get(
     p.account_id, p.caption, p.image_url ?? null, p.video_url ?? null, p.source_url ?? null,
-    p.kind ?? kindFor(p.source_url), JSON.stringify(p.external_ids),
+    p.kind, JSON.stringify(p.external_ids),
   ) as { id: number }
   return row.id
 }
 
 export type PostView = 'queue' | 'failed' | 'history' | 'all'
-type ListedPost = Post & { username: string; platform: string }
+export type Metrics = { views: number; likes: number; replies: number; reposts: number; quotes: number; shares: number }
+type ListedPost = Post & { username: string; platform: string } & { [K in keyof Metrics]: number | null }
 
 // p.id breaks ties, so a page boundary never repeats or skips posts sharing a timestamp.
 const VIEWS: Record<PostView, { where: string; order: string }> = {
@@ -285,23 +338,41 @@ export function pagePosts(view: PostView, o: { kind?: PostKind | null; limit?: n
   const kind = o.kind ?? null
   const from = `
     FROM posts p JOIN accounts a ON a.id = p.account_id
+    LEFT JOIN post_metrics m ON m.post_id = p.id
     WHERE ${VIEWS[view].where} AND (? IS NULL OR p.kind = ?)`
   const { n } = getDb().prepare(`SELECT COUNT(*) n ${from}`).get(kind, kind) as { n: number }
   const posts = getDb().prepare(`
-    SELECT p.*, a.username, a.platform ${from}
+    SELECT p.*, a.username, a.platform, m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares ${from}
     ORDER BY ${VIEWS[view].order} LIMIT ? OFFSET ?
   `).all(kind, kind, o.limit ?? 50, o.offset ?? 0) as ListedPost[]
   return { posts, total: n }
 }
 
-/** Failed posts go back to 'scheduled' for retry until MAX_ATTEMPTS. */
+/**
+ * Hands a claimed post back untouched, for a failure that was the account's, not
+ * the post's: the attempt is not counted and it keeps its slot. error says why it waits.
+ */
+export function releasePost(id: number, error: string) {
+  getDb().prepare(`
+    UPDATE posts SET status = 'scheduled', attempts = MAX(attempts - 1, 0), claimed_at = NULL, error = ?
+    WHERE id = ?
+  `).run(error.slice(0, 1000), id)
+}
+
+/**
+ * Failed posts go back to 'scheduled' for retry until MAX_ATTEMPTS, 10 minutes
+ * later per attempt so far (10, then 20), so other due posts go out meanwhile.
+ */
 export function markFailed(id: number, error: string, maxAttempts = 3, retryable = true) {
+  const r = retryable ? 1 : 0
   getDb().prepare(`
     UPDATE posts
     SET status = CASE WHEN attempts >= ? OR ? = 0 THEN 'failed' ELSE 'scheduled' END,
+        scheduled_at = CASE WHEN attempts >= ? OR ? = 0 THEN scheduled_at
+                       ELSE datetime('now', '+' || (attempts * 10) || ' minutes') END,
         error = ?, retryable = ?
     WHERE id = ?
-  `).run(maxAttempts, retryable ? 1 : 0, error.slice(0, 1000), retryable ? 1 : 0, id)
+  `).run(maxAttempts, r, maxAttempts, r, error.slice(0, 1000), r, id)
 }
 
 /** Retries always start over from part 1; delete any partial thread on Threads first. */
@@ -353,6 +424,92 @@ export function stats(kind: PostKind | null = null) {
     failed: by.failed ?? 0,
     draft: by.draft ?? 0,
     accounts: accounts.n,
+  }
+}
+
+// --- insights ---------------------------------------------------------------
+
+/**
+ * Published posts whose insights to read now, root media id first in external_ids.
+ * Never-read posts come first, newest first (this also backfills older history once);
+ * then posts of the last 7 days whose reading is over 12 hours old. Later than
+ * 7 days the last reading stands. Accounts with a rejected token are skipped.
+ */
+export function postsNeedingInsights(limit: number): { id: number; account_id: number; media_id: string }[] {
+  return getDb().prepare(`
+    SELECT p.id, p.account_id, json_extract(p.external_ids, '$[0]') media_id FROM posts p
+    JOIN accounts a ON a.id = p.account_id AND a.enabled = 1 AND a.token_invalid_at IS NULL
+    LEFT JOIN post_metrics m ON m.post_id = p.id
+    WHERE p.status = 'published' AND json_extract(p.external_ids, '$[0]') IS NOT NULL
+      AND (m.post_id IS NULL
+        OR (p.published_at > datetime('now', '-7 days') AND m.fetched_at < datetime('now', '-12 hours')))
+    ORDER BY m.post_id IS NOT NULL, p.published_at DESC, p.id DESC
+    LIMIT ?
+  `).all(limit) as { id: number; account_id: number; media_id: string }[]
+}
+
+export function saveMetrics(postId: number, m: Metrics) {
+  getDb().prepare(`
+    INSERT INTO post_metrics (post_id, views, likes, replies, reposts, quotes, shares, error, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, datetime('now'))
+    ON CONFLICT (post_id) DO UPDATE SET
+      views = excluded.views, likes = excluded.likes, replies = excluded.replies,
+      reposts = excluded.reposts, quotes = excluded.quotes, shares = excluded.shares,
+      error = NULL, fetched_at = excluded.fetched_at
+  `).run(postId, m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares)
+}
+
+/** A failed reading waits like a good one, and keeps the metrics read before it. */
+export function saveMetricsError(postId: number, error: string) {
+  getDb().prepare(`
+    INSERT INTO post_metrics (post_id, error, fetched_at) VALUES (?, ?, datetime('now'))
+    ON CONFLICT (post_id) DO UPDATE SET error = excluded.error, fetched_at = excluded.fetched_at
+  `).run(postId, error.slice(0, 500))
+}
+
+export type KindSummary = Metrics & {
+  posts: number; covered: number
+  avg_views: number; avg_likes: number; engagement_rate: number
+}
+export type RankedPost = Metrics & { id: number; kind: PostKind; caption: string; published_at: string }
+
+/**
+ * Performance of posts published in the last `days`, per kind (or one kind).
+ * covered counts the posts with a reading; averages divide by it, not by posts.
+ * engagement_rate = (likes + replies + reposts + quotes + shares) / views.
+ * bottom skips posts under a day old, which have not had their audience yet.
+ */
+export function insightsSummary(days: number, kind: PostKind | null = null) {
+  const since = `-${days} days`
+  const where = "p.status = 'published' AND p.published_at > datetime('now', ?) AND (? IS NULL OR p.kind = ?)"
+  const rows = getDb().prepare(`
+    SELECT p.kind, COUNT(*) posts, COUNT(m.views) covered,
+      COALESCE(SUM(m.views), 0) views, COALESCE(SUM(m.likes), 0) likes, COALESCE(SUM(m.replies), 0) replies,
+      COALESCE(SUM(m.reposts), 0) reposts, COALESCE(SUM(m.quotes), 0) quotes, COALESCE(SUM(m.shares), 0) shares
+    FROM posts p LEFT JOIN post_metrics m ON m.post_id = p.id
+    WHERE ${where} GROUP BY p.kind
+  `).all(since, kind, kind) as (Metrics & { kind: PostKind; posts: number; covered: number })[]
+  const by_kind: Partial<Record<PostKind, KindSummary>> = {}
+  for (const { kind: k, ...r } of rows) {
+    const engaged = r.likes + r.replies + r.reposts + r.quotes + r.shares
+    by_kind[k] = {
+      ...r,
+      avg_views: r.covered ? Math.round(r.views / r.covered) : 0,
+      avg_likes: r.covered ? Math.round(r.likes / r.covered * 10) / 10 : 0,
+      engagement_rate: r.views ? Math.round(engaged / r.views * 10_000) / 10_000 : 0,
+    }
+  }
+  const ranked = (order: 'ASC' | 'DESC', extra = '') => getDb().prepare(`
+    SELECT p.id, p.kind, substr(p.caption, 1, 120) caption, p.published_at,
+      m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares
+    FROM posts p JOIN post_metrics m ON m.post_id = p.id
+    WHERE ${where} AND m.views IS NOT NULL ${extra}
+    ORDER BY m.views ${order}, p.id DESC LIMIT 5
+  `).all(since, kind, kind) as RankedPost[]
+  return {
+    days, kind, by_kind,
+    top: ranked('DESC'),
+    bottom: ranked('ASC', "AND p.published_at < datetime('now', '-1 day')"),
   }
 }
 

@@ -49,6 +49,9 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
 /** Codes 1 (unknown) and 2 (service) are Meta-side blips that often pass on a retry. */
 const isTransient = (e: unknown) => e instanceof ThreadsApiError && (e.code === 1 || e.code === 2)
 
+/** Code 190: the token is expired, revoked or malformed. Every call with it fails until a reconnect. */
+export const isInvalidToken = (e: unknown) => e instanceof ThreadsApiError && e.code === 190
+
 async function createContainer(userId: string, token: string, params: Record<string, string>): Promise<string> {
   for (const wait of [5000, 15000]) {
     try {
@@ -217,6 +220,47 @@ export async function publishToThreads({ text, imageUrl, videoUrl, userId, token
     if (i < parts.length - 1) await sleep(10000)
   }
   return ids
+}
+
+const METRICS = ['views', 'likes', 'replies', 'reposts', 'quotes', 'shares'] as const
+export type PostInsights = Record<(typeof METRICS)[number], number>
+
+/**
+ * Lifetime insights of one post. Needs threads_manage_insights. For a reply
+ * chain, pass the root: Threads does not roll replies' numbers into it.
+ * A metric Threads leaves out reads as 0.
+ */
+export async function fetchPostInsights(mediaId: string, token: string): Promise<PostInsights> {
+  const { data } = await call(`/${mediaId}/insights`, { metric: METRICS.join(','), access_token: token }, 'GET')
+  const read = (name: string) => {
+    const m = (data ?? []).find((x: { name: string }) => x.name === name)
+    return Number(m?.values?.[0]?.value ?? m?.total_value?.value ?? 0) || 0
+  }
+  return Object.fromEntries(METRICS.map(n => [n, read(n)])) as PostInsights
+}
+
+/** Codes 10 and 200: the app or token lacks a permission, here threads_manage_insights. */
+export const isMissingPermission = (e: unknown) => e instanceof ThreadsApiError && (e.code === 10 || e.code === 200)
+
+/** Documented lifetime of a long-lived Threads token, used if Meta omits expires_in. */
+export const LONG_LIVED_SEC = 60 * 24 * 3600
+
+/**
+ * Trades a long-lived token for a fresh one, valid 60 days from now. Meta only
+ * refreshes a token that is at least 24 hours old and not yet expired.
+ */
+export async function refreshLongLivedToken(token: string): Promise<{ token: string; expiresAt: string }> {
+  const res = await fetch('https://graph.threads.net/refresh_access_token?' + new URLSearchParams({
+    grant_type: 'th_refresh_token',
+    access_token: token,
+  }))
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || !data.access_token)
+    throw new ThreadsApiError(`Threads token refresh: ${data.error?.message ?? `HTTP ${res.status}`}`, data.error?.code)
+  return {
+    token: data.access_token,
+    expiresAt: new Date(Date.now() + (Number(data.expires_in) || LONG_LIVED_SEC) * 1000).toISOString(),
+  }
 }
 
 /** Reads the profile behind a token — used to name an account after OAuth. */

@@ -49,7 +49,7 @@ expect "callback with forged state" 400 "$(code -b "$T/jar.txt" "$B/api/auth/thr
 
 echo "== input validation =="
 expect "missing text"           400 "$(code -X POST $B/api/publish/threads -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{}')"
-expect "http image rejected"    400 "$(code -X POST $B/api/publish/threads -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{"text":"x","imageUrl":"http://insecure/x.jpg"}')"
+expect "http image rejected"    400 "$(code -X POST $B/api/publish/threads -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{"text":"x","imageUrl":"http://insecure/x.jpg","kind":"news"}')"
 
 echo "== queue + dedup =="
 expect "queue needs media"      400 "$(code -X POST $B/api/posts -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{"caption":"hello"}')"
@@ -57,6 +57,10 @@ expect "image + video rejected" 400 "$(code -X POST $B/api/posts -H "Authorizati
 grep -q items_without_media "$T/body.txt" && echo "  ok   both media -> items_without_media" || { echo "  FAIL both media payload"; cat "$T/body.txt"; fail=1; }
 expect "video passes media check" 400 "$(code -X POST $B/api/posts -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{"caption":"x","videoUrl":"https://a/x.mp4"}')"
 grep -q items_without_media "$T/body.txt" && { echo "  FAIL video rejected as missing media"; cat "$T/body.txt"; fail=1; } || echo "  ok   video accepted as media"
+expect "queue needs kind"       400 "$(code -X POST $B/api/posts -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{"caption":"x","imageUrl":"https://a/x.jpg"}')"
+grep -q items_with_invalid_kind "$T/body.txt" && echo "  ok   no kind -> items_with_invalid_kind" || { echo "  FAIL kind payload"; cat "$T/body.txt"; fail=1; }
+expect "wrong-case kind"        400 "$(code -X POST $B/api/posts -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{"caption":"x","imageUrl":"https://a/x.jpg","kind":"News"}')"
+expect "publish needs kind"     400 "$(code -X POST $B/api/publish/threads -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{"text":"x","imageUrl":"https://a/x.jpg"}')"
 
 # Last: this fills the limiter for 10.9.9.9. A spoofed first X-Forwarded-For
 # entry must not reset it; only the hop nginx appends counts.

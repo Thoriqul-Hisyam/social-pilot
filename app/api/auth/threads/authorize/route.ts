@@ -5,7 +5,7 @@ import { OAUTH_STATE_COOKIE, hasValidSession, unauthorized } from '@/lib/auth'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-const SCOPES = 'threads_basic,threads_content_publish,threads_manage_replies,threads_delete'
+const SCOPES = 'threads_basic,threads_content_publish,threads_manage_replies,threads_delete,threads_manage_insights'
 
 /**
  * Only a logged-in dashboard user may start a connect. The random state goes

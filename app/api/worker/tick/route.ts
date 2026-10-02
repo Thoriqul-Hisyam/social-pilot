@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { claimDuePost, getAccountToken, logEvent, markFailed, markPublished } from '@/lib/db'
-import { ChainBrokenError, publishToThreads } from '@/lib/threads'
+import { claimDuePost, getAccountToken, logEvent, markFailed, markPublished, releasePost } from '@/lib/db'
+import { ChainBrokenError, isInvalidToken, publishToThreads } from '@/lib/threads'
 import { rehostImage } from '@/lib/media'
+import { pauseForInvalidToken, refreshDueTokens } from '@/lib/tokens'
+import { collectInsights } from '@/lib/insights'
 import { hasValidApiKey, hasValidSession, unauthorized } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -14,10 +16,15 @@ export const dynamic = 'force-dynamic'
  *
  * Returns {published:false, reason:'nothing_due'} when idle — callers should
  * treat that as success and stay silent.
+ *
+ * Token refresh and insight reading ride on the same cron, before the queue,
+ * so they run even when nothing is due.
  */
 export async function POST(request: NextRequest) {
   if (!hasValidApiKey(request) && !hasValidSession(request)) return unauthorized()
 
+  await refreshDueTokens()
+  await collectInsights()
   const post = claimDuePost()
   if (!post) return NextResponse.json({ published: false, reason: 'nothing_due' })
   logEvent({ agent: 'publisher', to_agent: 'observer', kind: 'working', message: `Mengirim post #${post.id} ke Threads.`, post_id: post.id })
@@ -43,6 +50,12 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ published: true, id: post.id, post_ids: ids, parts: ids.length })
   } catch (e) {
     const error = String(e)
+    // A rejected token fails every post alike: hold the queue rather than burn their attempts.
+    if (isInvalidToken(e)) {
+      releasePost(post.id, `menunggu akun dihubungkan ulang: ${error}`)
+      pauseForInvalidToken(post.account_id, e)
+      return NextResponse.json({ published: false, id: post.id, error, paused: true }, { status: 409 })
+    }
     // A broken chain is deleted again, so it can retry from the root. If some parts
     // could not be deleted, fail at once: a retry would repost them. Retry by hand after deleting.
     const stuck = e instanceof ChainBrokenError && e.liveIds.length > 0

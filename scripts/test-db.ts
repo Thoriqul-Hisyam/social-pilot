@@ -81,20 +81,37 @@ db.upsertAccount({ platform: 'threads', external_id: '999', username: 'renamed',
 check('upsert does not duplicate', db.listAccounts().length === 1)
 check('upsert updates username', db.listAccounts()[0].username === 'renamed')
 
+// --- token refresh selection ---
+const setExpiry = (days: number | null) =>
+  db.getDb().prepare('UPDATE accounts SET token_expires_at = ?, token_checked_at = NULL WHERE id = ?')
+    .run(days === null ? null : new Date(Date.now() + days * 86_400_000).toISOString(), acc)
+const refreshDue = () => db.accountsDueForRefresh().some(a => a.id === acc)
+setExpiry(null); check('unknown expiry is due for refresh', refreshDue())
+setExpiry(58); check('a fresh token is not due', !refreshDue())
+setExpiry(10); check('a token with 10 days left is due', refreshDue())
+check('due account comes decrypted', db.accountsDueForRefresh()[0]?.token === secret)
+db.markTokenChecked(acc); check('a token tried in the last 12h waits', !refreshDue())
+db.getDb().prepare("UPDATE accounts SET token_checked_at = datetime('now', '-13 hours') WHERE id = ?").run(acc)
+check('and is tried again after 12h', refreshDue())
+db.updateAccountToken(acc, 'refreshed-token', new Date(Date.now() + 60 * 86_400_000).toISOString())
+check('refreshed token decrypts back', db.getAccountToken(acc)?.token === 'refreshed-token')
+const stored = db.getDb().prepare('SELECT access_token FROM accounts WHERE id = ?').get(acc) as { access_token: string }
+check('refreshed token stored encrypted', !stored.access_token.includes('refreshed-token'))
+check('a refreshed token is no longer due', !refreshDue())
+
 // --- posts + dedup ---
 const past = new Date(Date.now() - 60_000).toISOString().replace('T', ' ').slice(0, 19)
 const future = new Date(Date.now() + 3_600_000).toISOString().replace('T', ' ').slice(0, 19)
 
-const p1 = db.queuePost({ account_id: acc, caption: 'first', source_url: 'https://a/1', scheduled_at: past })
+const p1 = db.queuePost({ account_id: acc, caption: 'first', source_url: 'https://a/1', kind: 'news', scheduled_at: past })
 check('post queued', p1 !== null)
-check('duplicate source_url skipped', db.queuePost({ account_id: acc, caption: 'dup', source_url: 'https://a/1', scheduled_at: past }) === null)
+check('duplicate source_url skipped', db.queuePost({ account_id: acc, caption: 'dup', source_url: 'https://a/1', kind: 'news', scheduled_at: past }) === null)
 check('null source_url allowed twice',
-  db.queuePost({ account_id: acc, caption: 'x', scheduled_at: future }) !== null &&
-  db.queuePost({ account_id: acc, caption: 'y', scheduled_at: future }) !== null)
-check('kind defaults to news with a source', db.listPosts().find(p => p.id === p1)?.kind === 'news')
-check('kind defaults to affiliate without one', kindOf('x') === 'affiliate')
+  db.queuePost({ account_id: acc, caption: 'x', kind: 'affiliate', scheduled_at: future }) !== null &&
+  db.queuePost({ account_id: acc, caption: 'y', kind: 'affiliate', scheduled_at: future }) !== null)
+check('kind is stored as given', db.listPosts().find(p => p.id === p1)?.kind === 'news' && kindOf('x') === 'affiliate')
 const manual = db.queuePost({ account_id: acc, caption: 'manual news', kind: 'news', scheduled_at: future })!
-check('explicit kind wins over the default', db.listPosts().find(p => p.id === manual)?.kind === 'news')
+check('kind does not depend on a source url', db.listPosts().find(p => p.id === manual)?.kind === 'news')
 check('affiliate may repeat a source_url',
   db.queuePost({ account_id: acc, caption: 'aff 1', source_url: 'https://shop/1', kind: 'affiliate', scheduled_at: future }) !== null &&
   db.queuePost({ account_id: acc, caption: 'aff 2', source_url: 'https://shop/1', kind: 'affiliate', scheduled_at: future }) !== null)
@@ -111,15 +128,21 @@ const done = db.listPosts().find(p => p.id === p1)!
 check('marked published', done.status === 'published')
 check('external ids stored', done.external_ids === '["111","222"]')
 
-const p2 = db.queuePost({ account_id: acc, caption: 'retry me', scheduled_at: past })!
+const p2 = db.queuePost({ account_id: acc, caption: 'retry me', kind: 'news', scheduled_at: past })!
 db.claimDuePost()
 db.markFailed(p2, 'boom', 3)
 check('failure retries first', db.listPosts().find(p => p.id === p2)!.status === 'scheduled')
-for (let i = 0; i < 3; i++) { db.claimDuePost(); db.markFailed(p2, 'boom', 3) }
+const p2At = () => (db.getDb().prepare('SELECT scheduled_at FROM posts WHERE id = ?').get(p2) as { scheduled_at: string }).scheduled_at
+check('first retry waits 10 minutes', p2At() > db.toSqlTime(Date.now() + 9 * 60_000) && p2At() <= db.toSqlTime(Date.now() + 10 * 60_000))
+check('a post waiting to retry is not claimed', db.claimDuePost() === null)
+const makeP2Due = () => db.getDb().prepare('UPDATE posts SET scheduled_at = ? WHERE id = ?').run(past, p2)
+makeP2Due(); db.claimDuePost(); db.markFailed(p2, 'boom', 3)
+check('second retry waits 20 minutes', p2At() > db.toSqlTime(Date.now() + 19 * 60_000))
+makeP2Due(); db.claimDuePost(); db.markFailed(p2, 'boom', 3)
 check('failure gives up after maxAttempts', db.listPosts().find(p => p.id === p2)!.status === 'failed')
 
 // Rows failed before setup and empty-image errors became retryable still carry retryable = 0.
-const p3 = db.queuePost({ account_id: acc, caption: 'old error', scheduled_at: past })!
+const p3 = db.queuePost({ account_id: acc, caption: 'old error', kind: 'news', scheduled_at: past })!
 for (const old of ['Error: R2 not configured: set R2_BUCKET', 'Error: unsupported image format (not an image) from cdn.antaranews.com: Threads takes JPEG or PNG only']) {
   db.claimDuePost()
   db.markFailed(p3, old, 1, false)
@@ -129,10 +152,62 @@ db.claimDuePost()
 db.markFailed(p3, 'Error: unsupported image format (webp)', 1, false)
 check('content error stays permanent', !db.retryPost(p3).ok)
 
+// --- a rejected token pauses the account's queue ---
+const p4 = db.queuePost({ account_id: acc, caption: 'paused', kind: 'news', scheduled_at: past })!
+check('post claimed before the pause', db.claimDuePost()?.id === p4)
+db.releasePost(p4, 'menunggu akun dihubungkan ulang')
+const p4Row = () => db.getDb().prepare('SELECT status, attempts, scheduled_at, error FROM posts WHERE id = ?').get(p4) as
+  { status: string; attempts: number; scheduled_at: string; error: string | null }
+check('released post keeps its slot, attempt not counted',
+  p4Row().status === 'scheduled' && p4Row().attempts === 0 && p4Row().scheduled_at === past && !!p4Row().error)
+check('first pause names the account', db.markTokenInvalid(acc) === 'renamed')
+check('a second pause stays quiet', db.markTokenInvalid(acc) === null)
+check('a paused account is not claimed', db.claimDuePost() === null)
+setExpiry(null); check('a paused account is not refreshed', !refreshDue())
+db.upsertAccount({ platform: 'threads', external_id: '999', username: 'renamed', access_token: secret })
+check('reconnect lifts the pause', db.listAccounts()[0].token_invalid_at === null && db.claimDuePost()?.id === p4)
+db.markFailed(p4, 'done with it', 1, false)
+db.markTokenInvalid(acc)
+db.updateAccountToken(acc, secret, new Date(Date.now() + 60 * 86_400_000).toISOString())
+check('a refreshed token lifts the pause', db.listAccounts()[0].token_invalid_at === null)
+
+// --- insights ---
+const a1 = db.recordPublishedPost({ account_id: acc, caption: 'news A', kind: 'news', external_ids: ['n1', 'n1r'] })
+const a2 = db.recordPublishedPost({ account_id: acc, caption: 'aff B', kind: 'affiliate', external_ids: ['a1'] })
+const a3 = db.recordPublishedPost({ account_id: acc, caption: 'aff C', kind: 'affiliate', external_ids: ['a2'] })
+const needIds = () => db.postsNeedingInsights(50).map(p => p.id)
+check('never-read posts need insights, newest first', needIds().slice(0, 3).join() === [a3, a2, a1].join())
+check('a chain is read at its root', db.postsNeedingInsights(50).find(p => p.id === a1)?.media_id === 'n1')
+db.saveMetrics(a1, { views: 1000, likes: 50, replies: 5, reposts: 3, quotes: 1, shares: 1 })
+db.saveMetrics(a2, { views: 200, likes: 2, replies: 0, reposts: 0, quotes: 0, shares: 0 })
+db.saveMetricsError(a3, 'boom')
+check('a fresh reading, good or failed, waits', !needIds().includes(a1) && !needIds().includes(a3))
+db.getDb().prepare("UPDATE post_metrics SET fetched_at = datetime('now', '-13 hours') WHERE post_id = ?").run(a1)
+check('a reading over 12h old is refreshed within the week', needIds().includes(a1))
+db.getDb().prepare("UPDATE posts SET published_at = datetime('now', '-8 days') WHERE id = ?").run(a1)
+check('after a week the last reading stands', !needIds().includes(a1))
+db.getDb().prepare("UPDATE posts SET published_at = datetime('now', '-2 days') WHERE id = ?").run(a1)
+db.saveMetricsError(a1, 'later failure')
+const ins = db.insightsSummary(7)
+check('a failed reading keeps the metrics read before it', ins.by_kind.news?.views === 1000)
+// p1 is a published news post that was never read
+check('summary counts posts and readings per kind',
+  ins.by_kind.news?.posts === 2 && ins.by_kind.news?.covered === 1 &&
+  ins.by_kind.affiliate?.posts === 2 && ins.by_kind.affiliate?.covered === 1)
+check('averages divide by readings', ins.by_kind.news?.avg_views === 1000 && ins.by_kind.affiliate?.avg_likes === 2)
+check('engagement rate', ins.by_kind.news?.engagement_rate === 0.06)
+check('top is ordered by views', ins.top.map(p => p.id).join() === [a1, a2].join())
+check('bottom skips posts under a day old', ins.bottom.map(p => p.id).join() === String(a1))
+check('insights kind filter', Object.keys(db.insightsSummary(7, 'affiliate').by_kind).join() === 'affiliate')
+check('history rows carry metrics', db.pagePosts('history', { limit: 100 }).posts.find(p => p.id === a1)?.views === 1000)
+for (const id of [a1, a2, a3]) db.deletePost(id)
+check('metrics go with their post', (db.getDb().prepare('SELECT COUNT(*) n FROM post_metrics').get() as { n: number }).n === 0)
+
 // --- disabled accounts are never published for ---
 db.setAccountEnabled(acc, false)
 check('disabled account hides token', db.getAccountToken(acc) === null)
-db.queuePost({ account_id: acc, caption: 'should not run', scheduled_at: past })
+setExpiry(null); check('disabled account is never refreshed', !refreshDue())
+db.queuePost({ account_id: acc, caption: 'should not run', kind: 'news', scheduled_at: past })
 check('disabled account posts not claimed', db.claimDuePost() === null)
 
 // --- queue tail: a new batch lines up after pending slots, not on top of them ---
@@ -141,13 +216,13 @@ const gap = 30 * 60_000
 check('toSqlTime matches scheduled_at format', /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(db.toSqlTime(now)))
 // 'x' and 'y' wait at +60 min: more than one gap away, so not part of the train yet
 check('tail stays at now across a long gap', db.queueTail(gap, now) === now)
-db.queuePost({ account_id: acc, caption: 'train 1', scheduled_at: db.toSqlTime(now + 20 * 60_000) })
-db.queuePost({ account_id: acc, caption: 'train 2', scheduled_at: db.toSqlTime(now + 45 * 60_000) })
+db.queuePost({ account_id: acc, caption: 'train 1', kind: 'news', scheduled_at: db.toSqlTime(now + 20 * 60_000) })
+db.queuePost({ account_id: acc, caption: 'train 2', kind: 'news', scheduled_at: db.toSqlTime(now + 45 * 60_000) })
 const futureMs = Date.parse(`${future.replace(' ', 'T')}Z`)
 check('tail follows the train to its last slot', db.queueTail(gap, now) === futureMs)
-db.queuePost({ account_id: acc, caption: 'parked', scheduled_at: db.toSqlTime(now + 3 * 86_400_000) })
+db.queuePost({ account_id: acc, caption: 'parked', kind: 'news', scheduled_at: db.toSqlTime(now + 3 * 86_400_000) })
 check('a post parked days ahead does not move the tail', db.queueTail(gap, now) === futureMs)
-const vid = db.queuePost({ account_id: acc, caption: 'video', video_url: 'https://v/1.mp4', scheduled_at: future })!
+const vid = db.queuePost({ account_id: acc, caption: 'video', video_url: 'https://v/1.mp4', kind: 'news', scheduled_at: future })!
 check('video post stored', db.listPosts().find(p => p.id === vid)?.video_url === 'https://v/1.mp4')
 
 // --- dashboard pages ---
@@ -167,4 +242,4 @@ check('stats count accounts', s.accounts === 0)
 check('stats count published', s.published === 1)
 
 cleanup()
-console.log(`OK — ${n} assertions passed (crypto, kind migration, accounts, dedup, atomic claim, retry, disabled-account guard, queue tail, pages)`)
+console.log(`OK — ${n} assertions passed (crypto, kind migration, accounts, token refresh, dedup, atomic claim, retry backoff, token pause, insights, disabled-account guard, queue tail, pages)`)
