@@ -27,8 +27,11 @@ export type Adapter = {
   fetchInsights(mediaId: string, account: AccountCredentials): Promise<Metrics>
   /** For 60-day tokens (Threads, Instagram): trade the token for a fresh one. */
   refreshLongLived?(token: string): Promise<TokenSet>
-  /** Deletes published parts, last first. Returns the ids still live. */
-  deletePosts?(ids: string[], token: string): Promise<string[]>
+  /**
+   * Deletes a published post, all its parts, last first. live lists the ids still
+   * up, with the reasons in errors. Absent where the platform's API cannot delete (Instagram).
+   */
+  deletePosts?(ids: string[], token: string): Promise<{ live: string[]; errors: string[] }>
 }
 
 /** The platforms that can be connected. */

@@ -457,7 +457,14 @@ export function liveIdsFromError(error: string | null): string[] {
   return m ? m[1].split(',').filter(Boolean) : []
 }
 
-/** Removes a post that is not mid-publish. Returns it so the caller can clean up Threads. */
+/** A post with gone_at, set when its platform said it no longer exists. */
+export function findPost(id: number): (Post & { gone_at: string | null }) | null {
+  return (getDb().prepare(`
+    SELECT p.*, m.gone_at FROM posts p LEFT JOIN post_metrics m ON m.post_id = p.id WHERE p.id = ?
+  `).get(id) as (Post & { gone_at: string | null }) | undefined) ?? null
+}
+
+/** Removes a post that is not mid-publish. Returns it so the caller can clean up the platform. */
 export function deletePost(id: number): { ok: true; post: Post } | { ok: false; reason: string } {
   const post = getDb().prepare('SELECT * FROM posts WHERE id = ?').get(id) as Post | undefined
   if (!post) return { ok: false, reason: 'post not found' }

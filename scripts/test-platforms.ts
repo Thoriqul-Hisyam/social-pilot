@@ -139,6 +139,26 @@ const fbBody = form(calls.find(c => c.url.endsWith('/p1/photos'))!.body)
 check('facebook returns the page post id', fbIds.join() === 'p1_post-1')
 check('facebook posts the whole caption with the R2 copy', fbBody.caption === news.trim() && fbBody.url.startsWith('https://media.test/facebook/') && fbBody.access_token === 'pt1')
 
+// Deleting published posts: a part already gone counts as deleted, a refusal names its reason
+routes = [
+  [/graph\.threads\.net\/v1\.0\/t-gone\?/, () => json({ error: { message: "Object with ID 't-gone' does not exist", code: 100, error_subcode: 33 } }, 400)],
+  [/graph\.threads\.net\/v1\.0\/t-\w+\?/, () => json({ success: true })],
+]
+calls.length = 0
+const tDel = await ADAPTERS.threads.deletePosts!(['t-root', 't-gone', 't-reply'], 'tok')
+check('threads deletes every part, last first, and counts a gone part as deleted',
+  tDel.live.length === 0 && calls.map(c => c.url.split('?')[0].split('/').pop()).join() === 't-reply,t-gone,t-root' && calls.every(c => c.method === 'DELETE'))
+routes = [
+  [/graph\.facebook\.com\/v25\.0\/vid-1\?/, () => json({ success: true })],
+  [/graph\.facebook\.com\/v25\.0\/p1_post-1\?/, () => json({ error: { message: 'Permissions error', code: 200 } }, 400)],
+]
+calls.length = 0
+const fDel = await ADAPTERS.facebook.deletePosts!(['video:vid-1'], 'pt1')
+check('facebook deletes a video by its video id', fDel.live.length === 0 && calls[0].url.includes('/vid-1?') && calls[0].method === 'DELETE')
+const fRefused = await ADAPTERS.facebook.deletePosts!(['p1_post-1'], 'pt1')
+check('a refused facebook delete stays live with its reason', fRefused.live.join() === 'p1_post-1' && fRefused.errors[0].includes('Permissions error'))
+check('instagram has no delete', !ADAPTERS.instagram.deletePosts)
+
 // The worker: a platform limit puts the post back, a rejected token pauses only that account
 const past = db.toSqlTime(Date.now() - 60_000)
 const capped = db.queuePost({ account_id: igAcc, caption: 'capped', image_url: 'https://cdn.test/a.png', kind: 'affiliate', scheduled_at: past })!

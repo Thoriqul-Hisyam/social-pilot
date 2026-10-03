@@ -1,4 +1,5 @@
 import type { Adapter } from './platforms'
+import { isGone } from './errors'
 import { graphCaller, insightValue } from './meta'
 import { FACEBOOK_JPEG, rehostJpeg } from './media'
 import { partsFor } from './text'
@@ -60,6 +61,16 @@ export const facebook: Adapter = {
     const url = await rehostJpeg(job.imageUrl!, 'facebook', FACEBOOK_JPEG)
     const res = await call(`/${a.external_id}/photos`, { url, caption, published: 'true', access_token: a.token })
     return [res.post_id ?? res.id]
+  },
+
+  /** A post that no longer exists counts as deleted. Meta documents this call unevenly, so a refusal comes back as an error to show. */
+  async deletePosts(ids, token) {
+    const live: string[] = [], errors: string[] = []
+    for (const id of [...ids].reverse()) {
+      try { await call(`/${id.startsWith(VIDEO) ? id.slice(VIDEO.length) : id}`, { access_token: token }, 'DELETE') }
+      catch (e) { if (!isGone(e)) { live.unshift(id); errors.push(String(e)) } }
+    }
+    return { live, errors }
   },
 
   async fetchInsights(mediaId, a) {

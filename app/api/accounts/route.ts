@@ -1,14 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { listAccounts, setAccountEnabled, setAccountRouting } from '@/lib/db'
 import { platformList } from '@/lib/platforms'
-import { hasValidSession, unauthorized } from '@/lib/auth'
+import { hasValidApiKey, hasValidSession, unauthorized } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-/** Accounts, plus every platform that can be connected and the env it still lacks. */
+/**
+ * Accounts, plus every platform that can be connected and the env it still lacks.
+ * The API key may read it too (Hermes checks the routing); changes stay dashboard-only.
+ */
 export async function GET(request: NextRequest) {
-  if (!hasValidSession(request)) return unauthorized()
+  if (!hasValidSession(request) && !hasValidApiKey(request)) return unauthorized()
   // token columns are never selected — safe to return as-is
   return NextResponse.json({ accounts: listAccounts(), platforms: platformList() })
 }

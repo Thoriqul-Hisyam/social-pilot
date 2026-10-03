@@ -117,9 +117,9 @@ Reverse proxy: lihat `deploy/nginx.conf`. Wajib meneruskan `X-Forwarded-For` —
 
 ### 5. Hubungkan akun
 
-Buka `https://domain.com`, login, klik **Hubungkan akun** lalu pilih platformnya (atau tombol platform di kartu Akun). Untuk menambah akun kedua di platform yang sama, keluar dulu dari akun pertama di browser (threads.net, instagram.com), lalu hubungkan lagi.
+Buka `https://domain.com`, login, klik **Hubungkan akun** di bar atas lalu pilih platformnya. Untuk menambah akun kedua di platform yang sama, keluar dulu dari akun pertama di browser (threads.net, instagram.com), lalu hubungkan lagi.
 
-Di kartu Akun, tombol **Berita** dan **Affiliate** di tiap akun menentukan jenis post dari Hermes yang masuk otomatis. Akun lama menerima keduanya; akun baru juga, sampai diubah.
+Akun yang terhubung tampil sebagai chip di bar atas. Klik chip untuk melihat masa berlaku token, menonaktifkan akun, dan memilih jenis post dari Hermes yang masuk otomatis lewat tombol **Berita** dan **Affiliate**. Akun lama menerima keduanya; akun baru juga, sampai diubah.
 
 Buka dashboard lewat domain yang sama dengan `PUBLIC_APP_URL` / `THREADS_REDIRECT_URI`, bukan `localhost` atau IP. Callback hanya menerima akun kalau cookie login dan cookie `state` OAuth ikut kembali, dan cookie itu terikat ke domain. Kalau penukaran ke token 60 hari gagal, akun tidak disimpan.
 
@@ -136,7 +136,7 @@ curl -X POST https://domain.com/api/posts \
   -d '{"items":[{"caption":"...","imageUrl":"https://...","sourceUrl":"https://...","kind":"news"}]}'
 ```
 
-Item tanpa `accountId` masuk ke **semua akun aktif yang menerima jenisnya** (tombol Berita/Affiliate di kartu Akun), masing-masing di antrean akunnya sendiri. Item yang tidak cocok dengan akun mana pun dilewati dan nomornya ada di `no_target`. Item dengan `accountId` hanya masuk ke akun itu. `captions` opsional mengganti caption untuk platform tertentu, misalnya `"captions":{"instagram":"versi pendek…","facebook":"…"}`; platform tanpa versi sendiri memakai `caption` dan dipotong otomatis.
+Item tanpa `accountId` masuk ke **semua akun aktif yang menerima jenisnya** (tombol Berita/Affiliate di chip akun pada bar atas), masing-masing di antrean akunnya sendiri. Item yang tidak cocok dengan akun mana pun dilewati dan nomornya ada di `no_target`. Item dengan `accountId` hanya masuk ke akun itu. `captions` opsional mengganti caption untuk platform tertentu, misalnya `"captions":{"instagram":"versi pendek…","facebook":"…"}`; platform tanpa versi sendiri memakai `caption` dan dipotong otomatis.
 
 `kind` wajib di setiap item: `news` (berita, sertakan `sourceUrl` artikelnya) atau `affiliate`, persis huruf kecil. Item tanpa `kind` atau dengan nilai lain menolak seluruh batch (HTTP 400, `items_with_invalid_kind` menyebut nomor itemnya), dan tidak ada yang masuk antrean. `sourceUrl` berita yang sama tidak akan diantrekan dua kali ke akun yang sama (`skipped_duplicates`); affiliate boleh berulang. Tiap item butuh tepat satu `imageUrl` atau `videoUrl` (HTTPS publik). `scheduledAt` opsional (ISO, boleh dengan offset seperti `+07:00`; tanpa zona dianggap UTC). Satu item yang tidak valid menolak seluruh batch.
 
@@ -158,6 +158,22 @@ curl "https://domain.com/api/insights?days=7&kind=news&platform=instagram" -H "A
 ```
 
 `days` 1–90 (default 7), `kind` dan `platform` (`threads`, `instagram`, `facebook`) opsional. Tanpa `platform`, angka semua platform dijumlahkan; views tiap platform dihitung berbeda, jadi bandingkan per platform. Hasilnya per jenis: `posts`, `covered` (post yang sudah terbaca), `errors` (post yang pembacaan terakhirnya gagal), `gone` (post yang sudah dihapus di Threads; tidak dibaca lagi dan tidak ikut di angka lain), total `views`/`likes`/`replies`/`reposts`/`quotes`/`shares`, `avg_views`, `avg_likes`, dan `engagement_rate` = (likes + replies + reposts + quotes + shares) / views. Ditambah `top` dan `bottom` (5 post, caption 120 karakter; `bottom` melewati post yang belum berumur sehari), serta `top_by_kind` dan `bottom_by_kind` per jenis. Angka diambil worker tick, 20 post per tick: post yang belum pernah terbaca lebih dulu (terbaru dulu, termasuk riwayat lama), lalu dibaca ulang tiap 3 jam di hari pertamanya dan tiap 12 jam sampai berumur seminggu. Pembacaan yang gagal dicoba lagi tiap jam sampai post berumur 30 hari. Kalau server tidak tersambung ke Threads, batch berhenti tanpa menandai post gagal dan dicoba lagi di tick berikutnya. Setelah akun dihubungkan ulang, riwayat lama butuh beberapa jam sampai terbaca semua; selama itu angka 30 hari masih didominasi post terbaru. Untuk chain, yang dibaca post akarnya; balasan tidak dijumlahkan Threads.
+
+Daftar akun dan routing-nya (hanya baca; mengubahnya tetap dari dashboard):
+
+```bash
+curl https://domain.com/api/accounts -H "Authorization: Bearer $API_KEY"
+```
+
+Hasilnya `accounts[]` (`id`, `platform`, `username`, `enabled`, `auto_news`, `auto_affiliate`, `token_expires_at`, `token_invalid_at`; token tidak pernah ikut) dan `platforms[]` (platform yang bisa dihubungkan beserta env yang masih kurang). `token_invalid_at` terisi berarti antrean akun itu dijeda.
+
+Hapus post:
+
+```bash
+curl -X DELETE https://domain.com/api/posts/123 -H "Authorization: Bearer $API_KEY"
+```
+
+Post yang sudah terbit dihapus di platformnya lebih dulu (Threads: semua bagian chain; Facebook: post Page), dan catatannya baru dihapus kalau itu berhasil. Kalau platform menolak, catatan tetap ada dan alasannya di `error` (HTTP 502). Instagram tidak bisa menghapus lewat API: hanya catatannya yang hilang (`manual: true`), hapus post-nya manual di aplikasi Instagram. Post yang sudah ditandai dihapus di platformnya cukup dihapus catatannya. Post di antrean atau yang gagal hanya dihapus catatannya, ditambah bagian chain Threads yang sempat tayang (`still_live` menyebut yang gagal dihapus). Di dashboard, tombol **Hapus** ada di Antrean, Gagal, dan Riwayat.
 
 Tick manual (hasilnya `results`, satu entri per post yang dikirim):
 
@@ -184,7 +200,7 @@ Smoke test terhadap server yang sedang jalan (memverifikasi auth, OAuth state, v
 ```bash
 sh scripts/setup-test-env.sh   # generate secret lokal
 npm run dev -- --port 7949 &
-sh scripts/smoke.sh            # 29 pemeriksaan HTTP; SP_TMP=<dir> untuk ganti /tmp
+sh scripts/smoke.sh            # 32 pemeriksaan HTTP; SP_TMP=<dir> untuk ganti /tmp
 ```
 
 `setup-test-env.sh` menimpa `ENCRYPTION_KEY` di `.env.local`, jadi token akun yang tersimpan tidak bisa dibaca lagi. Di mesin yang sudah punya akun terhubung, berikan secret uji dan `DATABASE_PATH` sementara lewat environment variable saja; nilai itu menang atas `.env.local`.

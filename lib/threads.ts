@@ -1,4 +1,4 @@
-import { isTransient, MetaApiError, NetworkError, sleep } from './errors'
+import { isGone, isTransient, MetaApiError, NetworkError, sleep } from './errors'
 import { graphCaller, insightValue } from './meta'
 import { splitForThreads } from './text'
 import { rehostImage } from './media'
@@ -78,12 +78,21 @@ async function createAndPublish(userId: string, token: string, params: Record<st
   }
 }
 
-/** Deletes published parts, last reply first. Needs threads_delete. Returns the ids still live. */
-export async function deleteThreadsPosts(ids: string[], token: string): Promise<string[]> {
+/**
+ * Deletes published parts, last reply first. Needs threads_delete. Returns the ids
+ * still live; a part that no longer exists counts as deleted, so a retry finishes
+ * what an earlier attempt started. Each failure's reason goes into `errors`.
+ */
+export async function deleteThreadsPosts(ids: string[], token: string, errors: string[] = []): Promise<string[]> {
   const live: string[] = []
   for (const id of [...ids].reverse()) {
     try { await call(`/${id}`, { access_token: token }, 'DELETE') }
-    catch (e) { console.error(`Threads rollback: ${id}: ${e}`); live.unshift(id) }
+    catch (e) {
+      if (isGone(e)) continue
+      console.error(`Threads delete: ${id}: ${e}`)
+      errors.push(String(e))
+      live.unshift(id)
+    }
   }
   return live
 }
@@ -253,5 +262,8 @@ export const threads: Adapter = {
 
   fetchInsights: (mediaId, a) => fetchPostInsights(mediaId, a.token),
   refreshLongLived: refreshLongLivedToken,
-  deletePosts: deleteThreadsPosts,
+  async deletePosts(ids, token) {
+    const errors: string[] = []
+    return { live: await deleteThreadsPosts(ids, token, errors), errors }
+  },
 }

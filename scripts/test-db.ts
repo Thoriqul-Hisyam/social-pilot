@@ -229,6 +229,7 @@ db.saveMetrics(a4, { views: 5000, likes: 10, replies: 0, reposts: 0, quotes: 0, 
 db.saveMetricsGone(a4, 'Threads API [insights 100/33]: Object does not exist')
 db.getDb().prepare("UPDATE post_metrics SET fetched_at = datetime('now', '-2 days') WHERE post_id = ?").run(a4)
 check('a post deleted on Threads is never read again', !needIds().includes(a4))
+check('findPost carries gone_at', !!db.findPost(a4)?.gone_at && db.findPost(a1)?.gone_at === null && db.findPost(999999) === null)
 const gone = db.insightsSummary(7)
 check('a deleted post is counted apart and left out of the numbers',
   gone.by_kind.news?.gone === 1 && gone.by_kind.news?.posts === 2 && gone.by_kind.news?.views === 1000 &&

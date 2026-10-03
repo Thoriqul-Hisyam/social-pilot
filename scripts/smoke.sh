@@ -33,6 +33,9 @@ expect "tick with key"          200 "$(code -X POST $B/api/worker/tick -H "Autho
 grep -q nothing_due "$T/body.txt" && echo "  ok   tick idle -> nothing_due" || { echo "  FAIL tick payload"; cat "$T/body.txt"; fail=1; }
 
 expect "bad key rejected"       401 "$(code -X POST $B/api/worker/tick -H 'Authorization: Bearer wrong-key-here')"
+expect "accounts with key"      200 "$(code $B/api/accounts -H "Authorization: Bearer $K")"
+grep -q access_token "$T/body.txt" && { echo "  FAIL accounts leak a token"; fail=1; } || echo "  ok   accounts carry no token"
+expect "accounts PATCH with key" 401 "$(code -X PATCH $B/api/accounts -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d '{"id":1,"enabled":false}')"
 
 echo "== session login works =="
 expect "good login"             200 "$(code -c "$T/jar.txt" -X POST $B/api/login -H 'Content-Type: application/json' -d "{\"password\":\"$P\"}")"
