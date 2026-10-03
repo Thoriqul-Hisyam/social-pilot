@@ -1,5 +1,5 @@
-/** Self-check for splitForThreads. No network, no publishing. */
-import { splitForThreads, threadsPreview } from '../lib/threads'
+/** Self-check for splitForThreads and error classification. No network, no publishing. */
+import { isDeletedOnThreads, isMissingPermission, splitForThreads, threadsPreview, ThreadsApiError } from '../lib/threads'
 
 const L = 500
 let n = 0
@@ -49,5 +49,13 @@ const huge = 'Kalimat yang cukup panjang untuk mengisi bagian demi bagian. '.rep
 check('preview flags truncation', threadsPreview(huge).truncated)
 check('preview never exceeds 7 parts', threadsPreview(huge).parts <= 7 && threadsPreview(huge).parts === splitForThreads(huge).length)
 check('preview empty', threadsPreview('').parts === 1 && !threadsPreview('').truncated)
+
+// insight errors: only "does not exist" marks a post deleted on Threads
+const apiErr = (msg: string, code?: number, sub?: number) => new ThreadsApiError(`Threads API [insights]: ${msg}`, code, sub)
+check('100/33 is a deleted post', isDeletedOnThreads(apiErr('Unsupported get request.', 100, 33)))
+check('100 without subcode reads the message', isDeletedOnThreads(apiErr("Object with ID '1' does not exist", 100)))
+check('other code 100 errors are not deletions', !isDeletedOnThreads(apiErr('Invalid parameter', 100)))
+check('a missing permission is not a deletion', !isDeletedOnThreads(apiErr('does not exist', 10)) && isMissingPermission(apiErr('x', 10)))
+check('a plain error is not a deletion', !isDeletedOnThreads(new Error('does not exist')))
 
 console.log(`OK — ${n} assertions passed; long sample split into ${parts.length} parts, sizes ${parts.map(p => p.length).join(', ')}`)

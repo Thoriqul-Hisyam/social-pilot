@@ -27,6 +27,12 @@ old.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE UNIQUE INDEX idx_posts_dedup ON posts (account_id, source_url) WHERE source_url IS NOT NULL;
+  -- post_metrics as first shipped, before gone_at
+  CREATE TABLE post_metrics (
+    post_id INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,
+    views INTEGER, likes INTEGER, replies INTEGER, reposts INTEGER, quotes INTEGER, shares INTEGER,
+    error TEXT, fetched_at TEXT NOT NULL
+  );
   INSERT INTO accounts (platform, external_id, username, access_token) VALUES ('threads', '999', 'tester', 'x');
   INSERT INTO posts (account_id, caption, source_url, status, scheduled_at) VALUES
     (1, 'old news', 'https://old/news', 'draft', '2026-01-01 00:00:00'),
@@ -206,7 +212,30 @@ check('top per kind', ins.top_by_kind.news?.map(p => p.id).join() === String(a1)
 const affOnly = db.insightsSummary(7, 'affiliate')
 check('insights kind filter', Object.keys(affOnly.by_kind).join() === 'affiliate' && Object.keys(affOnly.top_by_kind).join() === 'affiliate')
 check('history rows carry metrics', db.pagePosts('history', { limit: 100 }).posts.find(p => p.id === a1)?.views === 1000)
-for (const id of [a1, a2, a3]) db.deletePost(id)
+// a3's reading failed; a failed reading is retried daily up to 30 days, past the week
+const setA3 = (published: string, fetched: string) => {
+  db.getDb().prepare("UPDATE posts SET published_at = datetime('now', ?) WHERE id = ?").run(published, a3)
+  db.getDb().prepare("UPDATE post_metrics SET fetched_at = datetime('now', ?) WHERE post_id = ?").run(fetched, a3)
+}
+setA3('-10 days', '-25 hours')
+check('a failed reading is retried daily past the week', needIds().includes(a3))
+setA3('-10 days', '-2 hours')
+check('a failed reading waits a day between retries', !needIds().includes(a3))
+setA3('-31 days', '-25 hours')
+check('a failed reading stands after 30 days', !needIds().includes(a3))
+// a4 was read, then deleted on Threads
+const a4 = db.recordPublishedPost({ account_id: acc, caption: 'news gone', kind: 'news', external_ids: ['g1'] })
+db.saveMetrics(a4, { views: 5000, likes: 10, replies: 0, reposts: 0, quotes: 0, shares: 0 })
+db.saveMetricsGone(a4, 'Threads API [insights 100/33]: Object does not exist')
+db.getDb().prepare("UPDATE post_metrics SET fetched_at = datetime('now', '-2 days') WHERE post_id = ?").run(a4)
+check('a post deleted on Threads is never read again', !needIds().includes(a4))
+const gone = db.insightsSummary(7)
+check('a deleted post is counted apart and left out of the numbers',
+  gone.by_kind.news?.gone === 1 && gone.by_kind.news?.posts === 2 && gone.by_kind.news?.views === 1000 &&
+  gone.by_kind.news?.errors === 1 && gone.by_kind.affiliate?.gone === 0)
+check('a deleted post is not ranked', !gone.top.some(p => p.id === a4))
+check('history marks a deleted post', !!db.pagePosts('history', { limit: 100 }).posts.find(p => p.id === a4)?.gone_at)
+for (const id of [a1, a2, a3, a4]) db.deletePost(id)
 check('metrics go with their post', (db.getDb().prepare('SELECT COUNT(*) n FROM post_metrics').get() as { n: number }).n === 0)
 
 // --- disabled accounts are never published for ---

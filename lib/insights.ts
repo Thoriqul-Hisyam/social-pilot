@@ -1,5 +1,5 @@
-import { getAccountToken, logEvent, postsNeedingInsights, saveMetrics, saveMetricsError } from './db'
-import { fetchPostInsights, isInvalidToken, isMissingPermission } from './threads'
+import { getAccountToken, logEvent, postsNeedingInsights, saveMetrics, saveMetricsError, saveMetricsGone } from './db'
+import { fetchPostInsights, isDeletedOnThreads, isInvalidToken, isMissingPermission } from './threads'
 import { pauseForInvalidToken } from './tokens'
 
 /**
@@ -26,6 +26,7 @@ export async function collectInsights(limit = PER_TICK) {
   try { due = postsNeedingInsights(limit) } catch (e) { console.error(`insights: ${e}`); return }
   const tokens = new Map<number, string | null>()
   const failed: string[] = []
+  const gone: string[] = []
   for (const p of due) {
     if (!tokens.has(p.account_id)) tokens.set(p.account_id, getAccountToken(p.account_id)?.token ?? null)
     const token = tokens.get(p.account_id)
@@ -42,10 +43,17 @@ export async function collectInsights(limit = PER_TICK) {
         return
       }
       if (isInvalidToken(e)) { pauseForInvalidToken(p.account_id, e); tokens.set(p.account_id, null); continue }
-      failed.push(`#${p.id}: ${e}`)
-      try { saveMetricsError(p.id, String(e)) } catch (e2) { console.error(`insights: post ${p.id}: ${e2}`) }
+      const deleted = isDeletedOnThreads(e)
+      if (deleted) gone.push(`#${p.id}`)
+      else failed.push(`#${p.id}: ${e}`)
+      try { (deleted ? saveMetricsGone : saveMetricsError)(p.id, String(e)) } catch (e2) { console.error(`insights: post ${p.id}: ${e2}`) }
     }
   }
+  // Each post is marked once, so this needs no throttle.
+  if (gone.length) logEvent({
+    agent: 'publisher', to_agent: 'observer', kind: 'info',
+    message: `${gone.length} post sudah dihapus di Threads, tidak dibaca lagi dan tidak dihitung di Performa: ${gone.join(', ')}`,
+  })
   if (failed.length && Date.now() - lastFailureNotice > HOUR_MS) {
     lastFailureNotice = Date.now()
     logEvent({

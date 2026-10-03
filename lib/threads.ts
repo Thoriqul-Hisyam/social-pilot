@@ -16,12 +16,14 @@ export class ChainBrokenError extends Error {
   }
 }
 
-/** An error answer from the Graph API. code is Meta's error code, when it sent one. */
+/** An error answer from the Graph API. code and subcode are Meta's, when it sent them. */
 export class ThreadsApiError extends Error {
   readonly code?: number
-  constructor(message: string, code?: number) {
+  readonly subcode?: number
+  constructor(message: string, code?: number, subcode?: number) {
     super(message)
     this.code = code
+    this.subcode = subcode
   }
 }
 
@@ -41,7 +43,7 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
     const msg = err.error_user_msg ?? err.message ?? `HTTP ${res.status}`
     // Meta support asks for fbtrace_id; code 1 carries no other detail.
     const trace = err.fbtrace_id ? ` (fbtrace_id ${err.fbtrace_id})` : ''
-    throw new ThreadsApiError(`Threads API [${step(path)}${code ? ` ${code}` : ''}]: ${msg}${trace}`, err.code)
+    throw new ThreadsApiError(`Threads API [${step(path)}${code ? ` ${code}` : ''}]: ${msg}${trace}`, err.code, err.error_subcode)
   }
   return data
 }
@@ -241,6 +243,10 @@ export async function fetchPostInsights(mediaId: string, token: string): Promise
 
 /** Codes 10 and 200: the app or token lacks a permission, here threads_manage_insights. */
 export const isMissingPermission = (e: unknown) => e instanceof ThreadsApiError && (e.code === 10 || e.code === 200)
+
+/** Code 100/33, "Object with ID ... does not exist": the post was deleted on Threads. */
+export const isDeletedOnThreads = (e: unknown) =>
+  e instanceof ThreadsApiError && e.code === 100 && (e.subcode === 33 || /does not exist/i.test(e.message))
 
 /** Documented lifetime of a long-lived Threads token, used if Meta omits expires_in. */
 export const LONG_LIVED_SEC = 60 * 24 * 3600

@@ -93,7 +93,8 @@ export function getDb(): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_events_recent ON agent_events (created_at DESC);
 
     -- latest Threads insights of a published post's root. NULL metrics = never read;
-    -- error = the last read failed (the metrics from before it stay)
+    -- error = the last read failed (the metrics from before it stay);
+    -- gone_at = Threads said the post no longer exists, so it is never read again
     CREATE TABLE IF NOT EXISTS post_metrics (
       post_id    INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,
       views      INTEGER,
@@ -103,7 +104,8 @@ export function getDb(): DatabaseSync {
       quotes     INTEGER,
       shares     INTEGER,
       error      TEXT,
-      fetched_at TEXT NOT NULL
+      fetched_at TEXT NOT NULL,
+      gone_at    TEXT
     );
   `)
   // Keep existing installations compatible with the retry diagnostics.
@@ -112,6 +114,7 @@ export function getDb(): DatabaseSync {
   try { db.exec('ALTER TABLE posts ADD COLUMN video_url TEXT') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE accounts ADD COLUMN token_checked_at TEXT') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE accounts ADD COLUMN token_invalid_at TEXT') } catch { /* already migrated */ }
+  try { db.exec('ALTER TABLE post_metrics ADD COLUMN gone_at TEXT') } catch { /* already migrated */ }
   // Rows from before the column: news always carried its article URL, affiliate never did.
   // Column and backfill land together, so a failed upgrade never leaves every row marked news.
   const cols = db.prepare('PRAGMA table_info(posts)').all() as { name: string }[]
@@ -323,7 +326,7 @@ export function recordPublishedPost(p: {
 
 export type PostView = 'queue' | 'failed' | 'history' | 'all'
 export type Metrics = { views: number; likes: number; replies: number; reposts: number; quotes: number; shares: number }
-type ListedPost = Post & { username: string; platform: string } & { [K in keyof Metrics]: number | null }
+type ListedPost = Post & { username: string; platform: string; gone_at: string | null } & { [K in keyof Metrics]: number | null }
 
 // p.id breaks ties, so a page boundary never repeats or skips posts sharing a timestamp.
 const VIEWS: Record<PostView, { where: string; order: string }> = {
@@ -343,7 +346,7 @@ export function pagePosts(view: PostView, o: { kind?: PostKind | null; limit?: n
     WHERE ${VIEWS[view].where} AND (? IS NULL OR p.kind = ?)`
   const { n } = getDb().prepare(`SELECT COUNT(*) n ${from}`).get(kind, kind) as { n: number }
   const posts = getDb().prepare(`
-    SELECT p.*, a.username, a.platform, m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares ${from}
+    SELECT p.*, a.username, a.platform, m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares, m.gone_at ${from}
     ORDER BY ${VIEWS[view].order} LIMIT ? OFFSET ?
   `).all(kind, kind, o.limit ?? 50, o.offset ?? 0) as ListedPost[]
   return { posts, total: n }
@@ -434,18 +437,21 @@ export function stats(kind: PostKind | null = null) {
  * Published posts whose insights to read now, root media id first in external_ids.
  * Never-read posts come first, newest first (this also backfills older history once).
  * Then stale readings: every 3 hours in a post's first day, while its numbers still
- * climb, and every 12 hours until it is a week old. After that the last reading stands.
- * Accounts with a rejected token are skipped.
+ * climb, and every 12 hours until it is a week old. After that the last reading stands,
+ * unless it failed: a failed reading is retried daily while the post is under 30 days
+ * old, the longest dashboard period. Posts deleted on Threads and accounts with a
+ * rejected token are skipped.
  */
 export function postsNeedingInsights(limit: number): { id: number; account_id: number; media_id: string }[] {
   return getDb().prepare(`
     SELECT p.id, p.account_id, json_extract(p.external_ids, '$[0]') media_id FROM posts p
     JOIN accounts a ON a.id = p.account_id AND a.enabled = 1 AND a.token_invalid_at IS NULL
     LEFT JOIN post_metrics m ON m.post_id = p.id
-    WHERE p.status = 'published' AND json_extract(p.external_ids, '$[0]') IS NOT NULL
+    WHERE p.status = 'published' AND json_extract(p.external_ids, '$[0]') IS NOT NULL AND m.gone_at IS NULL
       AND (m.post_id IS NULL
         OR (p.published_at > datetime('now', '-1 day') AND m.fetched_at < datetime('now', '-3 hours'))
-        OR (p.published_at > datetime('now', '-7 days') AND m.fetched_at < datetime('now', '-12 hours')))
+        OR (p.published_at > datetime('now', '-7 days') AND m.fetched_at < datetime('now', '-12 hours'))
+        OR (m.error IS NOT NULL AND p.published_at > datetime('now', '-30 days') AND m.fetched_at < datetime('now', '-1 day')))
     ORDER BY m.post_id IS NOT NULL, p.published_at DESC, p.id DESC
     LIMIT ?
   `).all(limit) as { id: number; account_id: number; media_id: string }[]
@@ -470,8 +476,16 @@ export function saveMetricsError(postId: number, error: string) {
   `).run(postId, error.slice(0, 500))
 }
 
+/** The post was deleted on Threads: stop reading it and leave it out of the numbers. */
+export function saveMetricsGone(postId: number, error: string) {
+  getDb().prepare(`
+    INSERT INTO post_metrics (post_id, error, fetched_at, gone_at) VALUES (?, ?, datetime('now'), datetime('now'))
+    ON CONFLICT (post_id) DO UPDATE SET error = excluded.error, fetched_at = excluded.fetched_at, gone_at = excluded.gone_at
+  `).run(postId, error.slice(0, 500))
+}
+
 export type KindSummary = Metrics & {
-  posts: number; covered: number; errors: number
+  posts: number; covered: number; errors: number; gone: number
   avg_views: number; avg_likes: number; engagement_rate: number
 }
 export type RankedPost = Metrics & { id: number; kind: PostKind; caption: string; published_at: string }
@@ -480,6 +494,7 @@ export type RankedPost = Metrics & { id: number; kind: PostKind; caption: string
  * Performance of posts published in the last `days`, per kind (or one kind).
  * covered counts the posts with a reading; averages divide by it, not by posts.
  * errors counts posts whose latest reading failed.
+ * gone counts posts deleted on Threads; every other number leaves them out.
  * engagement_rate = (likes + replies + reposts + quotes + shares) / views.
  * top/bottom rank across the kinds asked for; top_by_kind/bottom_by_kind rank each.
  * bottom skips posts under a day old, which have not had their audience yet.
@@ -487,13 +502,16 @@ export type RankedPost = Metrics & { id: number; kind: PostKind; caption: string
 export function insightsSummary(days: number, kind: PostKind | null = null) {
   const since = `-${days} days`
   const where = "p.status = 'published' AND p.published_at > datetime('now', ?) AND (? IS NULL OR p.kind = ?)"
+  // m holds readings of posts still on Threads, g marks the deleted ones.
   const rows = getDb().prepare(`
-    SELECT p.kind, COUNT(*) posts, COUNT(m.views) covered, COUNT(m.error) errors,
+    SELECT p.kind, COUNT(*) - COUNT(g.post_id) posts, COUNT(g.post_id) gone, COUNT(m.views) covered, COUNT(m.error) errors,
       COALESCE(SUM(m.views), 0) views, COALESCE(SUM(m.likes), 0) likes, COALESCE(SUM(m.replies), 0) replies,
       COALESCE(SUM(m.reposts), 0) reposts, COALESCE(SUM(m.quotes), 0) quotes, COALESCE(SUM(m.shares), 0) shares
-    FROM posts p LEFT JOIN post_metrics m ON m.post_id = p.id
+    FROM posts p
+    LEFT JOIN post_metrics m ON m.post_id = p.id AND m.gone_at IS NULL
+    LEFT JOIN post_metrics g ON g.post_id = p.id AND g.gone_at IS NOT NULL
     WHERE ${where} GROUP BY p.kind
-  `).all(since, kind, kind) as (Metrics & { kind: PostKind; posts: number; covered: number; errors: number })[]
+  `).all(since, kind, kind) as (Metrics & { kind: PostKind; posts: number; covered: number; errors: number; gone: number })[]
   const by_kind: Partial<Record<PostKind, KindSummary>> = {}
   for (const { kind: k, ...r } of rows) {
     const engaged = r.likes + r.replies + r.reposts + r.quotes + r.shares
@@ -508,7 +526,7 @@ export function insightsSummary(days: number, kind: PostKind | null = null) {
     SELECT p.id, p.kind, substr(p.caption, 1, 120) caption, p.published_at,
       m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares
     FROM posts p JOIN post_metrics m ON m.post_id = p.id
-    WHERE ${where} AND m.views IS NOT NULL
+    WHERE ${where} AND m.views IS NOT NULL AND m.gone_at IS NULL
       ${order === 'ASC' ? "AND p.published_at < datetime('now', '-1 day')" : ''}
     ORDER BY m.views ${order}, p.id DESC LIMIT 5
   `).all(since, k, k) as RankedPost[]
