@@ -212,16 +212,16 @@ check('top per kind', ins.top_by_kind.news?.map(p => p.id).join() === String(a1)
 const affOnly = db.insightsSummary(7, 'affiliate')
 check('insights kind filter', Object.keys(affOnly.by_kind).join() === 'affiliate' && Object.keys(affOnly.top_by_kind).join() === 'affiliate')
 check('history rows carry metrics', db.pagePosts('history', { limit: 100 }).posts.find(p => p.id === a1)?.views === 1000)
-// a3's reading failed; a failed reading is retried daily up to 30 days, past the week
+// a3's reading failed; a failed reading is retried hourly up to 30 days, past the week
 const setA3 = (published: string, fetched: string) => {
   db.getDb().prepare("UPDATE posts SET published_at = datetime('now', ?) WHERE id = ?").run(published, a3)
   db.getDb().prepare("UPDATE post_metrics SET fetched_at = datetime('now', ?) WHERE post_id = ?").run(fetched, a3)
 }
-setA3('-10 days', '-25 hours')
-check('a failed reading is retried daily past the week', needIds().includes(a3))
 setA3('-10 days', '-2 hours')
-check('a failed reading waits a day between retries', !needIds().includes(a3))
-setA3('-31 days', '-25 hours')
+check('a failed reading is retried hourly past the week', needIds().includes(a3))
+setA3('-10 days', '-30 minutes')
+check('a failed reading waits an hour between retries', !needIds().includes(a3))
+setA3('-31 days', '-2 hours')
 check('a failed reading stands after 30 days', !needIds().includes(a3))
 // a4 was read, then deleted on Threads
 const a4 = db.recordPublishedPost({ account_id: acc, caption: 'news gone', kind: 'news', external_ids: ['g1'] })
@@ -237,6 +237,24 @@ check('a deleted post is not ranked', !gone.top.some(p => p.id === a4))
 check('history marks a deleted post', !!db.pagePosts('history', { limit: 100 }).posts.find(p => p.id === a4)?.gone_at)
 for (const id of [a1, a2, a3, a4]) db.deletePost(id)
 check('metrics go with their post', (db.getDb().prepare('SELECT COUNT(*) n FROM post_metrics').get() as { n: number }).n === 0)
+
+// collectInsights against a stubbed Threads; a5 is the newest never-read post, so a batch of 1 reads it
+const { collectInsights } = await import('../lib/insights')
+const realFetch = globalThis.fetch
+const a5 = db.recordPublishedPost({ account_id: acc, caption: 'offline', kind: 'news', external_ids: ['o1'] })
+const a5Metrics = () => db.getDb().prepare('SELECT error, gone_at FROM post_metrics WHERE post_id = ?').get(a5) as
+  { error: string | null; gone_at: string | null } | undefined
+const lastEvent = () => (db.getDb().prepare('SELECT message FROM agent_events ORDER BY id DESC LIMIT 1').get() as { message: string }).message
+globalThis.fetch = (() => Promise.reject(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }))) as unknown as typeof fetch
+await collectInsights(1)
+check('a dropped connection fails no post', !a5Metrics() && needIds()[0] === a5)
+check('a dropped connection is reported with its cause', lastEvent().includes('tidak tersambung') && lastEvent().includes('ENOTFOUND'))
+globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify(
+  { error: { message: "Object with ID 'o1' does not exist", code: 100, error_subcode: 33 } }), { status: 400 }))) as unknown as typeof fetch
+await collectInsights(1)
+check('a post deleted on Threads is marked by the worker', !!a5Metrics()?.gone_at && lastEvent().includes(`#${a5}`))
+globalThis.fetch = realFetch
+db.deletePost(a5)
 
 // --- disabled accounts are never published for ---
 db.setAccountEnabled(acc, false)

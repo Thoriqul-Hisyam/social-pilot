@@ -438,7 +438,7 @@ export function stats(kind: PostKind | null = null) {
  * Never-read posts come first, newest first (this also backfills older history once).
  * Then stale readings: every 3 hours in a post's first day, while its numbers still
  * climb, and every 12 hours until it is a week old. After that the last reading stands,
- * unless it failed: a failed reading is retried daily while the post is under 30 days
+ * unless it failed: a failed reading is retried hourly while the post is under 30 days
  * old, the longest dashboard period. Posts deleted on Threads and accounts with a
  * rejected token are skipped.
  */
@@ -451,7 +451,7 @@ export function postsNeedingInsights(limit: number): { id: number; account_id: n
       AND (m.post_id IS NULL
         OR (p.published_at > datetime('now', '-1 day') AND m.fetched_at < datetime('now', '-3 hours'))
         OR (p.published_at > datetime('now', '-7 days') AND m.fetched_at < datetime('now', '-12 hours'))
-        OR (m.error IS NOT NULL AND p.published_at > datetime('now', '-30 days') AND m.fetched_at < datetime('now', '-1 day')))
+        OR (m.error IS NOT NULL AND p.published_at > datetime('now', '-30 days') AND m.fetched_at < datetime('now', '-1 hour')))
     ORDER BY m.post_id IS NOT NULL, p.published_at DESC, p.id DESC
     LIMIT ?
   `).all(limit) as { id: number; account_id: number; media_id: string }[]

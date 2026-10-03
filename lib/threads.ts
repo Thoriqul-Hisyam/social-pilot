@@ -27,15 +27,23 @@ export class ThreadsApiError extends Error {
   }
 }
 
+/** No answer from Threads at all: DNS, a dropped connection, a timeout. Says nothing about the post. */
+export class NetworkError extends Error {}
+
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 /** Step name for errors, without the user id: "/123/threads_publish" -> "threads_publish". */
 const step = (path: string) => path.split('/').filter(Boolean).pop() ?? path
 
 async function call(path: string, params: Record<string, string>, method: 'GET' | 'POST' | 'DELETE' = 'POST') {
-  const res = method === 'POST'
-    ? await fetch(`${API}${path}`, { method, body: new URLSearchParams(params) })
-    : await fetch(`${API}${path}?${new URLSearchParams(params)}`, { method })
+  const res = await (method === 'POST'
+    ? fetch(`${API}${path}`, { method, body: new URLSearchParams(params) })
+    : fetch(`${API}${path}?${new URLSearchParams(params)}`, { method })
+  ).catch((e: unknown) => {
+    // Node's "fetch failed" keeps the actual reason (ECONNRESET, ENOTFOUND, ...) in cause.
+    const cause = (e as { cause?: { code?: string; message?: string } })?.cause
+    throw new NetworkError(`Threads API [${step(path)}]: fetch failed (${cause?.code ?? cause?.message ?? String(e)})`)
+  })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     const err = data?.error ?? {}
@@ -48,8 +56,8 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
   return data
 }
 
-/** Codes 1 (unknown) and 2 (service) are Meta-side blips that often pass on a retry. */
-const isTransient = (e: unknown) => e instanceof ThreadsApiError && (e.code === 1 || e.code === 2)
+/** Codes 1 (unknown) and 2 (service) are Meta-side blips that often pass on a retry, as do dropped connections. */
+const isTransient = (e: unknown) => e instanceof NetworkError || e instanceof ThreadsApiError && (e.code === 1 || e.code === 2)
 
 /** Code 190: the token is expired, revoked or malformed. Every call with it fails until a reconnect. */
 export const isInvalidToken = (e: unknown) => e instanceof ThreadsApiError && e.code === 190
@@ -142,11 +150,19 @@ export function threadsPreview(text: string, limit = LIMIT, maxParts = 7): { par
 /**
  * Waits until a container is ready. Publishing one still IN_PROGRESS fails
  * with "The requested resource does not exist", even for plain text.
+ * A dropped connection only costs a poll; the deadline still holds.
  */
 async function waitForContainer(id: string, token: string, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    const { status, error_message } = await call(`/${id}`, { fields: 'status,error_message', access_token: token }, 'GET')
+    let res
+    try { res = await call(`/${id}`, { fields: 'status,error_message', access_token: token }, 'GET') }
+    catch (e) {
+      if (!(e instanceof NetworkError) || Date.now() > deadline) throw e
+      await sleep(5000)
+      continue
+    }
+    const { status, error_message } = res
     if (status === 'FINISHED' || status === 'PUBLISHED') return
     if (status === 'ERROR' || status === 'EXPIRED') throw new Error(`Threads container ${status}: ${error_message ?? 'no detail'}`)
     if (Date.now() > deadline) throw new Error(`Threads container not ready after ${timeoutMs / 1000}s (status ${status})`)

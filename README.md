@@ -127,7 +127,7 @@ Insight performa (untuk dashboard dan crew):
 curl "https://domain.com/api/insights?days=7&kind=news" -H "Authorization: Bearer $API_KEY"
 ```
 
-`days` 1–90 (default 7), `kind` opsional. Hasilnya per jenis: `posts`, `covered` (post yang sudah terbaca), `errors` (post yang pembacaan terakhirnya gagal), `gone` (post yang sudah dihapus di Threads; tidak dibaca lagi dan tidak ikut di angka lain), total `views`/`likes`/`replies`/`reposts`/`quotes`/`shares`, `avg_views`, `avg_likes`, dan `engagement_rate` = (likes + replies + reposts + quotes + shares) / views. Ditambah `top` dan `bottom` (5 post, caption 120 karakter; `bottom` melewati post yang belum berumur sehari), serta `top_by_kind` dan `bottom_by_kind` per jenis. Angka diambil worker tick, 20 post per tick: post yang belum pernah terbaca lebih dulu (terbaru dulu, termasuk riwayat lama), lalu dibaca ulang tiap 3 jam di hari pertamanya dan tiap 12 jam sampai berumur seminggu. Pembacaan yang gagal dicoba lagi sehari sekali sampai post berumur 30 hari. Setelah akun dihubungkan ulang, riwayat lama butuh beberapa jam sampai terbaca semua; selama itu angka 30 hari masih didominasi post terbaru. Untuk chain, yang dibaca post akarnya; balasan tidak dijumlahkan Threads.
+`days` 1–90 (default 7), `kind` opsional. Hasilnya per jenis: `posts`, `covered` (post yang sudah terbaca), `errors` (post yang pembacaan terakhirnya gagal), `gone` (post yang sudah dihapus di Threads; tidak dibaca lagi dan tidak ikut di angka lain), total `views`/`likes`/`replies`/`reposts`/`quotes`/`shares`, `avg_views`, `avg_likes`, dan `engagement_rate` = (likes + replies + reposts + quotes + shares) / views. Ditambah `top` dan `bottom` (5 post, caption 120 karakter; `bottom` melewati post yang belum berumur sehari), serta `top_by_kind` dan `bottom_by_kind` per jenis. Angka diambil worker tick, 20 post per tick: post yang belum pernah terbaca lebih dulu (terbaru dulu, termasuk riwayat lama), lalu dibaca ulang tiap 3 jam di hari pertamanya dan tiap 12 jam sampai berumur seminggu. Pembacaan yang gagal dicoba lagi tiap jam sampai post berumur 30 hari. Kalau server tidak tersambung ke Threads, batch berhenti tanpa menandai post gagal dan dicoba lagi di tick berikutnya. Setelah akun dihubungkan ulang, riwayat lama butuh beberapa jam sampai terbaca semua; selama itu angka 30 hari masih didominasi post terbaru. Untuk chain, yang dibaca post akarnya; balasan tidak dijumlahkan Threads.
 
 Tick manual:
 
@@ -144,7 +144,7 @@ curl https://domain.com/api/health
 ## Test
 
 ```bash
-npm test            # 125 assertions: crypto, DB, migrasi kind, refresh token, jeda token, insight, post dihapus di Threads, dedup, paginasi, jeda retry, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
+npm test            # 130 assertions: crypto, DB, migrasi kind, refresh token, jeda token, insight, post dihapus di Threads, dedup, paginasi, jeda retry, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
 npm run typecheck   # tsc --noEmit
 npm run build       # production build
 ```

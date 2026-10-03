@@ -1,5 +1,8 @@
 /** Self-check for splitForThreads and error classification. No network, no publishing. */
-import { isDeletedOnThreads, isMissingPermission, splitForThreads, threadsPreview, ThreadsApiError } from '../lib/threads'
+import {
+  fetchPostInsights, isDeletedOnThreads, isMissingPermission, NetworkError, publishToThreads,
+  splitForThreads, threadsPreview, ThreadsApiError,
+} from '../lib/threads'
 
 const L = 500
 let n = 0
@@ -57,5 +60,23 @@ check('100 without subcode reads the message', isDeletedOnThreads(apiErr("Object
 check('other code 100 errors are not deletions', !isDeletedOnThreads(apiErr('Invalid parameter', 100)))
 check('a missing permission is not a deletion', !isDeletedOnThreads(apiErr('does not exist', 10)) && isMissingPermission(apiErr('x', 10)))
 check('a plain error is not a deletion', !isDeletedOnThreads(new Error('does not exist')))
+
+// dropped connections: named with their cause, and ridden out where a retry is safe.
+// fetch is stubbed and sleeps are instant, so nothing leaves the machine or waits.
+const realFetch = globalThis.fetch, realTimeout = globalThis.setTimeout
+const drop = () => Promise.reject(Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) }))
+const answer = (body: object) => () => Promise.resolve(new Response(JSON.stringify(body)))
+globalThis.setTimeout = ((fn: () => void) => { fn(); return 0 }) as unknown as typeof setTimeout
+globalThis.fetch = drop as unknown as typeof fetch
+const offline = await fetchPostInsights('1', 't').catch((e: unknown) => e)
+check('a dropped connection is a NetworkError naming its cause',
+  offline instanceof NetworkError && offline.message === 'Threads API [insights]: fetch failed (ECONNRESET)')
+// create fails, create, poll fails, poll FINISHED, publish
+const script = [drop, answer({ id: 'c1' }), drop, answer({ status: 'FINISHED' }), answer({ id: 'p1' })]
+globalThis.fetch = (() => script.shift()!()) as unknown as typeof fetch
+const published = await publishToThreads({ text: 'halo', imageUrl: 'https://x/a.jpg', userId: 'u', token: 't' }).catch((e: unknown) => e)
+check('publishing rides out dropped connections', Array.isArray(published) && published.join() === 'p1' && script.length === 0)
+globalThis.fetch = realFetch
+globalThis.setTimeout = realTimeout
 
 console.log(`OK — ${n} assertions passed; long sample split into ${parts.length} parts, sizes ${parts.map(p => p.length).join(', ')}`)

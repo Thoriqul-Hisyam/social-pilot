@@ -1,5 +1,5 @@
 import { getAccountToken, logEvent, postsNeedingInsights, saveMetrics, saveMetricsError, saveMetricsGone } from './db'
-import { fetchPostInsights, isDeletedOnThreads, isInvalidToken, isMissingPermission } from './threads'
+import { fetchPostInsights, isDeletedOnThreads, isInvalidToken, isMissingPermission, NetworkError } from './threads'
 import { pauseForInvalidToken } from './tokens'
 
 /**
@@ -15,10 +15,12 @@ const HOUR_MS = 3_600_000
 let blockedUntil = 0
 // Per-post failures are stored on the post; the crew feed hears of them at most hourly.
 let lastFailureNotice = 0
+// A dropped connection is the server's, not the post's: nothing is stored, the next tick tries again.
+let lastOfflineNotice = 0
 
 /**
  * Reads Threads insights for the posts that need them. Runs on each worker tick.
- * Sequential, so a missing permission costs one call, not a batch. Never throws.
+ * Sequential, so a missing permission or a dropped connection costs one call, not a batch. Never throws.
  */
 export async function collectInsights(limit = PER_TICK) {
   if (Date.now() < blockedUntil) return
@@ -27,6 +29,7 @@ export async function collectInsights(limit = PER_TICK) {
   const tokens = new Map<number, string | null>()
   const failed: string[] = []
   const gone: string[] = []
+  let offline: unknown = null
   for (const p of due) {
     if (!tokens.has(p.account_id)) tokens.set(p.account_id, getAccountToken(p.account_id)?.token ?? null)
     const token = tokens.get(p.account_id)
@@ -43,6 +46,7 @@ export async function collectInsights(limit = PER_TICK) {
         return
       }
       if (isInvalidToken(e)) { pauseForInvalidToken(p.account_id, e); tokens.set(p.account_id, null); continue }
+      if (e instanceof NetworkError) { offline = e; break }
       const deleted = isDeletedOnThreads(e)
       if (deleted) gone.push(`#${p.id}`)
       else failed.push(`#${p.id}: ${e}`)
@@ -59,6 +63,13 @@ export async function collectInsights(limit = PER_TICK) {
     logEvent({
       agent: 'publisher', to_agent: 'observer', kind: 'error',
       message: `Insight ${failed.length} dari ${due.length} post gagal dibaca; dicoba lagi nanti. Contoh ${failed[0]}`,
+    })
+  }
+  if (offline && Date.now() - lastOfflineNotice > HOUR_MS) {
+    lastOfflineNotice = Date.now()
+    logEvent({
+      agent: 'publisher', to_agent: 'observer', kind: 'error',
+      message: `Insight berhenti sementara: server tidak tersambung ke Threads. Tidak ada post yang dihitung gagal; dicoba lagi tiap tick. ${offline}`,
     })
   }
 }
