@@ -5,6 +5,7 @@ import { ArrowRight, CalendarClock, CircleAlert, CircleCheck, Eye, Inbox, KeyRou
 import { useApp } from './app'
 import { PageHead } from './shell'
 import { ActivityChart, Stat } from './charts'
+import { BrandMark } from './brand'
 import { api, compact, dayShort, daysLeft, greeting, handle, jakartaDay, KIND_LABEL, num, pct, PLATFORM_LABEL, relative, shortDateTime, time, tokenState, type Account, type Insights, type Post } from './format'
 import { Avatar, EmptyState, KindTag, PlatformBadge, Skeleton, Thumb } from './ui'
 
@@ -183,7 +184,7 @@ function Welcome({ platforms }: { platforms: string[] }) {
   return (
     <div className="page">
       <section className="welcome">
-        <span className="brand-mark big"><Send size={26} strokeWidth={2.2} /></span>
+        <span className="brand-mark big"><BrandMark size={36} /></span>
         <h1>Selamat datang di SocialPilot</h1>
         <p>Hubungkan akun pertamamu. Setelah itu post dari Hermes masuk antrean otomatis, dan kamu bisa menulis post sendiri kapan saja.</p>
         <div className="welcome-actions">

@@ -2,9 +2,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { CalendarClock, ChartColumn, CircleAlert, CircleCheck, LayoutDashboard, LogOut, Plus, RefreshCw, Send, SquarePen, UserRound, Users, X } from 'lucide-react'
+import { CalendarClock, ChartColumn, CircleAlert, CircleCheck, LayoutDashboard, LogOut, Plus, RefreshCw, SquarePen, UserRound, Users, X } from 'lucide-react'
 import { api, handle, PLATFORM_LABEL, shortDateTime, time, type Account, type Activity, type Group, type PlatformInfo } from './format'
 import { AppContext, type App, type ConfirmRequest } from './app'
+import { BrandMark } from './brand'
 import { Menu, Modal } from './ui'
 import { Composer } from './composer'
 
@@ -104,7 +105,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
         <header className="topbar">
           <div className="topbar-inner">
             <Link href="/" className="brand" aria-label="SocialPilot, beranda">
-              <span className="brand-mark"><Send size={17} strokeWidth={2.4} /></span>
+              <span className="brand-mark"><BrandMark size={21} /></span>
               <span className="brand-name">Social<b>Pilot</b></span>
             </Link>
             <nav className="nav" aria-label="Menu utama">

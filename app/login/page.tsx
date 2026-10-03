@@ -1,8 +1,9 @@
 'use client'
 
 import { useState } from 'react'
-import { BarChart3, CircleAlert, CircleCheck, Eye, EyeOff, Layers, Send, Zap } from 'lucide-react'
+import { BarChart3, CircleAlert, CircleCheck, Eye, EyeOff, Layers, Zap } from 'lucide-react'
 import { PlatformBadge } from '@/components/ui'
+import { BrandMark } from '@/components/brand'
 
 export default function Login() {
   const [password, setPassword] = useState('')
@@ -30,7 +31,7 @@ export default function Login() {
   return (
     <main className="login">
       <section className="login-art" aria-hidden>
-        <div className="brand"><span className="brand-mark"><Send size={17} strokeWidth={2.4} /></span><span className="brand-name">Social<b>Pilot</b></span></div>
+        <div className="brand"><span className="brand-mark"><BrandMark size={21} /></span><span className="brand-name">Social<b>Pilot</b></span></div>
         <div>
           <h2>Satu tempat untuk semua channel kamu.</h2>
           <p>Antrean otomatis dari Hermes, post manual kapan saja, dan performa tiap jenis konten.</p>
@@ -52,7 +53,7 @@ export default function Login() {
 
       <section className="login-pane">
         <form className="login-card" onSubmit={submit}>
-          <div className="brand"><span className="brand-mark"><Send size={17} strokeWidth={2.4} /></span><span className="brand-name">Social<b>Pilot</b></span></div>
+          <div className="brand"><span className="brand-mark"><BrandMark size={21} /></span><span className="brand-name">Social<b>Pilot</b></span></div>
           <h1>Masuk</h1>
           <p>Masukkan password dashboard untuk mengelola akun dan jadwal posting.</p>
           <label className="sr-only" htmlFor="password">Password</label>

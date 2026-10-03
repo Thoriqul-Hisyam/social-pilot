@@ -230,7 +230,6 @@ h1, h2, h3 { letter-spacing: -.015em }
   background: linear-gradient(140deg, #8f7dff 0%, #5b47e0 52%, #3a27b5 100%);
   box-shadow: 0 6px 14px -5px rgba(91, 71, 224, .7), inset 0 1px 0 rgba(255, 255, 255, .28);
 }
-.brand-mark svg { transform: translate(-1px, 1px) }
 .nav { display: flex; gap: 2px }
 .nav a { display: inline-flex; align-items: center; gap: 8px; height: 38px; padding: 0 14px; border-radius: var(--r-sm); color: var(--ink-2); font-weight: 600; text-decoration: none; transition: background .15s, color .15s }
 .nav a:hover { background: var(--sunken); color: var(--ink) }
