@@ -400,5 +400,19 @@ check('stats narrow to one account', db.stats(null, fb2).published === 1 && db.s
 db.saveMetrics(fp, { views: 900, likes: 9, replies: 0, reposts: 0, quotes: 0, shares: 0 })
 check('performa narrows to one account', db.insightsSummary(7, null, null, fb2).by_kind.news?.views === 900 && db.insightsSummary(7, null, null, acc).by_kind.news?.views !== 900)
 
+// --- caption search and daily activity, for the dashboard ---
+const hits = db.pagePosts('history', { q: 'ON FACEBOOK', limit: 100 })
+check('search matches captions whatever the case', hits.total === 1 && hits.posts[0].id === fp)
+check('search reads % as text, not a wildcard', db.pagePosts('history', { q: '%', limit: 100 }).total === 0)
+const act = db.activity(14)
+check('activity lists every day, today last', act.days.length === 14 && act.days.at(-1)!.day === act.today && act.days[0].day < act.today)
+check('activity counts today by kind', act.days.at(-1)!.news >= 2)
+check('activity narrows to one account', db.activity(14, null, fb2).days.at(-1)!.news === 1)
+check('activity narrows to one platform', db.activity(14, 'facebook').days.at(-1)!.news === 1)
+const actFb = act.accounts.find(a => a.account_id === fb), actFb2 = act.accounts.find(a => a.account_id === fb2)
+check('activity covers every account', act.accounts.length === db.listAccounts().length)
+check('activity shows a queue and its next slot', (actFb?.queued ?? 0) >= 1 && !!actFb?.next_at && actFb.queue_ends_at! >= actFb.next_at!)
+check('activity shows the last publish', actFb2?.published_24h === 1 && !!actFb2.published_at)
+
 cleanup()
-console.log(`OK — ${n} assertions passed (crypto, kind migration, accounts, token refresh, dedup, atomic claim, retry backoff, token pause, insights, disabled-account guard, queue tail, pages, routing, per-account claims, platform performa, groups, routing across groups, per-account views)`)
+console.log(`OK — ${n} assertions passed (crypto, kind migration, accounts, token refresh, dedup, atomic claim, retry backoff, token pause, insights, disabled-account guard, queue tail, pages, routing, per-account claims, platform performa, groups, routing across groups, per-account views, search, activity)`)

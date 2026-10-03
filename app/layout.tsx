@@ -1,8 +1,8 @@
 import './globals.css'
-import { Inter } from 'next/font/google'
+import { Plus_Jakarta_Sans } from 'next/font/google'
 
-const inter = Inter({ subsets: ['latin'] })
-export const metadata = { title: 'SocialPilot', description: 'Multi-account social publishing' }
+const sans = Plus_Jakarta_Sans({ subsets: ['latin'], variable: '--font-sans' })
+export const metadata = { title: { default: 'SocialPilot', template: '%s · SocialPilot' }, description: 'Multi-account social publishing' }
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  return <html lang="id"><body className={inter.className}>{children}</body></html>
-} 
+  return <html lang="id" className={sans.variable}><body>{children}</body></html>
+}

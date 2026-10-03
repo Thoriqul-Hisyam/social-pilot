@@ -463,19 +463,23 @@ const VIEWS: Record<PostView, { where: string; order: string }> = {
   all: { where: '1 = 1', order: 'p.scheduled_at DESC, p.id DESC' },
 }
 
-/** One page of a dashboard list, of one kind or (kind null) all, plus the total for paging. */
-export function pagePosts(view: PostView, o: { kind?: PostKind | null; accountId?: number | null; limit?: number; offset?: number } = {}) {
+/**
+ * One page of a dashboard list, of one kind or (kind null) all, plus the total for paging.
+ * q narrows it to captions containing that text, case-insensitively; instr, unlike LIKE, has no wildcards to escape.
+ */
+export function pagePosts(view: PostView, o: { kind?: PostKind | null; accountId?: number | null; q?: string | null; limit?: number; offset?: number } = {}) {
   if (view === 'queue') recoverStalePublishing()
-  const kind = o.kind ?? null, account = o.accountId ?? null
+  const kind = o.kind ?? null, account = o.accountId ?? null, q = o.q?.trim().toLowerCase() || null
   const from = `
     FROM posts p JOIN accounts a ON a.id = p.account_id
     LEFT JOIN post_metrics m ON m.post_id = p.id
-    WHERE ${VIEWS[view].where} AND (? IS NULL OR p.kind = ?) AND (? IS NULL OR p.account_id = ?)`
-  const { n } = getDb().prepare(`SELECT COUNT(*) n ${from}`).get(kind, kind, account, account) as { n: number }
+    WHERE ${VIEWS[view].where} AND (? IS NULL OR p.kind = ?) AND (? IS NULL OR p.account_id = ?)
+      AND (? IS NULL OR instr(lower(p.caption), ?) > 0)`
+  const { n } = getDb().prepare(`SELECT COUNT(*) n ${from}`).get(kind, kind, account, account, q, q) as { n: number }
   const posts = getDb().prepare(`
     SELECT p.*, a.username, a.platform, m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares, m.gone_at ${from}
     ORDER BY ${VIEWS[view].order} LIMIT ? OFFSET ?
-  `).all(kind, kind, account, account, o.limit ?? 50, o.offset ?? 0) as ListedPost[]
+  `).all(kind, kind, account, account, q, q, o.limit ?? 50, o.offset ?? 0) as ListedPost[]
   return { posts, total: n }
 }
 
@@ -689,6 +693,59 @@ export function insightsSummary(days: number, kind: PostKind | null = null, plat
     top_by_kind: perKind('DESC'),
     bottom_by_kind: perKind('ASC'),
   }
+}
+
+// --- activity ---------------------------------------------------------------
+
+/** Jakarta keeps no daylight saving, so its calendar day is the UTC clock 7 hours on. */
+const JAKARTA = '+7 hours'
+
+export type DayActivity = { day: string; news: number; affiliate: number; failed: number }
+export type AccountActivity = {
+  account_id: number; queued: number; failed: number
+  next_at: string | null; queue_ends_at: string | null; published_at: string | null; published_24h: number
+}
+
+/**
+ * For the dashboard's home and charts. days: each Jakarta calendar day of the last `days`,
+ * today last and empty days included, with what was published there by kind and what failed.
+ * platform and accountId narrow the days as they narrow insightsSummary.
+ * accounts: every account's queue (its next and last slot), failed posts, latest publish
+ * and publishes in the last 24 hours, never narrowed.
+ */
+export function activity(days: number, platform: Platform | null = null, accountId: number | null = null) {
+  const db = getDb()
+  const { today } = db.prepare(`SELECT date('now', '${JAKARTA}') today`).get() as { today: string }
+  const rows = db.prepare(`
+    SELECT date(COALESCE(p.published_at, p.scheduled_at), '${JAKARTA}') day,
+      SUM(p.status = 'published' AND p.kind = 'news') news,
+      SUM(p.status = 'published' AND p.kind = 'affiliate') affiliate,
+      SUM(p.status = 'failed') failed
+    FROM posts p
+    WHERE p.status IN ('published', 'failed')
+      AND COALESCE(p.published_at, p.scheduled_at) >= datetime(date('now', '${JAKARTA}', ?), '-7 hours')
+      AND (? IS NULL OR p.account_id IN (SELECT id FROM accounts WHERE platform = ?)) AND (? IS NULL OR p.account_id = ?)
+    GROUP BY day
+  `).all(`-${days - 1} days`, platform, platform, accountId, accountId) as DayActivity[]
+  const byDay = new Map(rows.map(r => [r.day, r]))
+  const start = Date.parse(`${today}T00:00:00Z`) - (days - 1) * 86_400_000
+  const series = Array.from({ length: days }, (_, i) => {
+    const day = new Date(start + i * 86_400_000).toISOString().slice(0, 10)
+    const r = byDay.get(day)
+    return { day, news: r?.news ?? 0, affiliate: r?.affiliate ?? 0, failed: r?.failed ?? 0 }
+  })
+  const accounts = db.prepare(`
+    SELECT a.id account_id,
+      COUNT(CASE WHEN p.status IN ('draft', 'scheduled', 'publishing') THEN 1 END) queued,
+      COUNT(CASE WHEN p.status = 'failed' THEN 1 END) failed,
+      MIN(CASE WHEN p.status IN ('scheduled', 'publishing') THEN p.scheduled_at END) next_at,
+      MAX(CASE WHEN p.status IN ('scheduled', 'publishing') THEN p.scheduled_at END) queue_ends_at,
+      MAX(CASE WHEN p.status = 'published' THEN p.published_at END) published_at,
+      COUNT(CASE WHEN p.status = 'published' AND p.published_at > datetime('now', '-1 day') THEN 1 END) published_24h
+    FROM accounts a LEFT JOIN posts p ON p.account_id = a.id
+    GROUP BY a.id ORDER BY a.id
+  `).all() as AccountActivity[]
+  return { today, days: series, accounts }
 }
 
 // --- crew ------------------------------------------------------------------

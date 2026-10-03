@@ -36,8 +36,8 @@ const MAX_PAGE_SIZE = 100
 
 /**
  * ?view=queue|failed|history (else all), ?kind=news|affiliate (else both),
- * ?account=<id> (else every account), ?page from 1 and ?limit up to 100.
- * Stats follow the kind and account filters.
+ * ?account=<id> (else every account), ?q=<text in the caption>, ?page from 1 and ?limit up to 100.
+ * Stats follow the kind and account filters, not q.
  */
 export async function GET(request: NextRequest) {
   if (!hasValidSession(request)) return unauthorized()
@@ -53,7 +53,7 @@ export async function GET(request: NextRequest) {
   const page = Math.max(Math.floor(Number(q.get('page'))) || 1, 1)
   const { posts, total } = pagePosts(
     view === 'queue' || view === 'failed' || view === 'history' ? view : 'all',
-    { kind, accountId: account, limit, offset: (page - 1) * limit },
+    { kind, accountId: account, q: q.get('q')?.slice(0, 200), limit, offset: (page - 1) * limit },
   )
   return NextResponse.json({ posts, total, page, limit, stats: stats(kind, account) })
 }
