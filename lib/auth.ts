@@ -70,9 +70,20 @@ export function unauthorized() {
   return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
 }
 
-// --- Threads OAuth ------------------------------------------------------------
+// --- OAuth (every platform) -----------------------------------------------------
 
 export const OAUTH_STATE_COOKIE = 'sp_oauth_state'
+
+/**
+ * The callback URL registered with a platform. Threads keeps THREADS_REDIRECT_URI;
+ * the others use <PLATFORM>_REDIRECT_URI if set, else /api/auth/<platform>/callback on the public origin.
+ */
+export function redirectUriFor(platform: string): string | null {
+  const explicit = process.env[`${platform.toUpperCase()}_REDIRECT_URI`]
+  if (explicit) return explicit
+  const origin = publicOrigin()
+  return origin ? `${origin}/api/auth/${platform}/callback` : null
+}
 
 /** The callback's ?state must match the cookie set when this browser started the connect. */
 export function hasValidOAuthState(request: NextRequest): boolean {

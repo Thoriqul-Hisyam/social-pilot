@@ -1,5 +1,18 @@
+import { isTransient, MetaApiError, NetworkError, sleep } from './errors'
+import { graphCaller, insightValue } from './meta'
+import { splitForThreads } from './text'
+import { rehostImage } from './media'
+import type { Adapter } from './platforms'
+
+// Older imports keep working: the text rules and error classes moved to shared modules.
+export { splitForThreads, threadsPreview } from './text'
+export { isInvalidToken, isMissingPermission, NetworkError } from './errors'
+export { isGone as isDeletedOnThreads } from './errors'
+/** An error answer from the Threads Graph API, classified by Meta's code. */
+export { MetaApiError as ThreadsApiError } from './errors'
+
 const API = 'https://graph.threads.net/v1.0'
-const LIMIT = 500
+const call = graphCaller(API, 'Threads')
 
 export type PublishInput = { text: string; imageUrl?: string; videoUrl?: string; userId: string; token: string }
 
@@ -16,52 +29,6 @@ export class ChainBrokenError extends Error {
   }
 }
 
-/** An error answer from the Graph API. code and subcode are Meta's, when it sent them. */
-export class ThreadsApiError extends Error {
-  readonly code?: number
-  readonly subcode?: number
-  constructor(message: string, code?: number, subcode?: number) {
-    super(message)
-    this.code = code
-    this.subcode = subcode
-  }
-}
-
-/** No answer from Threads at all: DNS, a dropped connection, a timeout. Says nothing about the post. */
-export class NetworkError extends Error {}
-
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
-
-/** Step name for errors, without the user id: "/123/threads_publish" -> "threads_publish". */
-const step = (path: string) => path.split('/').filter(Boolean).pop() ?? path
-
-async function call(path: string, params: Record<string, string>, method: 'GET' | 'POST' | 'DELETE' = 'POST') {
-  const res = await (method === 'POST'
-    ? fetch(`${API}${path}`, { method, body: new URLSearchParams(params) })
-    : fetch(`${API}${path}?${new URLSearchParams(params)}`, { method })
-  ).catch((e: unknown) => {
-    // Node's "fetch failed" keeps the actual reason (ECONNRESET, ENOTFOUND, ...) in cause.
-    const cause = (e as { cause?: { code?: string; message?: string } })?.cause
-    throw new NetworkError(`Threads API [${step(path)}]: fetch failed (${cause?.code ?? cause?.message ?? String(e)})`)
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) {
-    const err = data?.error ?? {}
-    const code = [err.code, err.error_subcode].filter(v => v != null).join('/')
-    const msg = err.error_user_msg ?? err.message ?? `HTTP ${res.status}`
-    // Meta support asks for fbtrace_id; code 1 carries no other detail.
-    const trace = err.fbtrace_id ? ` (fbtrace_id ${err.fbtrace_id})` : ''
-    throw new ThreadsApiError(`Threads API [${step(path)}${code ? ` ${code}` : ''}]: ${msg}${trace}`, err.code, err.error_subcode)
-  }
-  return data
-}
-
-/** Codes 1 (unknown) and 2 (service) are Meta-side blips that often pass on a retry, as do dropped connections. */
-const isTransient = (e: unknown) => e instanceof NetworkError || e instanceof ThreadsApiError && (e.code === 1 || e.code === 2)
-
-/** Code 190: the token is expired, revoked or malformed. Every call with it fails until a reconnect. */
-export const isInvalidToken = (e: unknown) => e instanceof ThreadsApiError && e.code === 190
-
 async function createContainer(userId: string, token: string, params: Record<string, string>): Promise<string> {
   for (const wait of [5000, 15000]) {
     try {
@@ -72,79 +39,6 @@ async function createContainer(userId: string, token: string, params: Record<str
     }
   }
   return (await call(`/${userId}/threads`, { ...params, access_token: token })).id
-}
-
-/**
- * Split text into <=LIMIT chunks, preferring paragraph then sentence breaks.
- * Never splits mid-word. A single over-long word is hard-cut as a last resort.
- */
-function pack(text: string, limit: number): string[] {
-  const out: string[] = []
-  let buf = ''
-
-  const flush = () => { if (buf.trim()) out.push(buf.trim()); buf = '' }
-  const fits = (a: string, b: string, sep: string) => (a ? a.length + sep.length : 0) + b.length <= limit
-  const add = (piece: string, sep: string) => {
-    if (fits(buf, piece, sep)) buf += (buf ? sep : '') + piece
-    else { flush(); buf = piece }
-  }
-
-  for (const para of text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean)) {
-    if (para.length <= limit) { add(para, '\n\n'); continue }
-
-    for (const sentence of para.match(/[^.!?]+[.!?]*\s*/g) ?? [para]) {
-      const s = sentence.trim()
-      if (!s) continue
-      if (s.length <= limit) { add(s, ' '); continue }
-
-      flush()
-      let line = ''
-      for (const word of s.split(/\s+/)) {
-        if (word.length > limit) {
-          if (line) { out.push(line); line = '' }
-          for (let i = 0; i < word.length; i += limit) out.push(word.slice(i, i + limit))
-          continue
-        }
-        if (fits(line, word, ' ')) line += (line ? ' ' : '') + word
-        else { out.push(line); line = word }
-      }
-      buf = line
-    }
-  }
-  flush()
-  return out
-}
-
-/**
- * Keep reply chains readable: Threads hard-caps 500 chars, so long source copy
- * is cut to at most maxParts. Preserves the opening context and the source URL
- * at the end; short posts remain untouched.
- */
-export function splitForThreads(text: string, limit = LIMIT, maxParts = 7): string[] {
-  const out = pack(text, limit)
-  if (out.length <= maxParts) return out.length ? out : ['']
-
-  // Paragraphs rarely fill a part exactly, so a cut that fits by length can
-  // still pack into too many parts. Shrink the cut until it fits.
-  const source = text.match(/(?:Sumber|Source):\s*https?:\/\/\S+/i)?.[0]
-  for (let cap = (limit - 20) * maxParts; cap > limit; cap -= 100) {
-    const compact = text.trim().slice(0, cap)
-    const body = source && !compact.includes(source)
-      ? `${compact.slice(0, cap - source.length - 2).trim()}\n\n${source}`
-      : compact
-    const parts = pack(body, limit)
-    if (parts.length <= maxParts) return parts
-  }
-  return out.slice(0, maxParts)
-}
-
-/**
- * What the composer shows before sending: how many posts the text becomes,
- * and whether splitForThreads will cut its tail to stay within maxParts.
- * Pure, so it runs in the browser too.
- */
-export function threadsPreview(text: string, limit = LIMIT, maxParts = 7): { parts: number; truncated: boolean } {
-  return { parts: splitForThreads(text, limit, maxParts).length, truncated: pack(text, limit).length > maxParts }
 }
 
 /**
@@ -250,19 +144,8 @@ export type PostInsights = Record<(typeof METRICS)[number], number>
  */
 export async function fetchPostInsights(mediaId: string, token: string): Promise<PostInsights> {
   const { data } = await call(`/${mediaId}/insights`, { metric: METRICS.join(','), access_token: token }, 'GET')
-  const read = (name: string) => {
-    const m = (data ?? []).find((x: { name: string }) => x.name === name)
-    return Number(m?.values?.[0]?.value ?? m?.total_value?.value ?? 0) || 0
-  }
-  return Object.fromEntries(METRICS.map(n => [n, read(n)])) as PostInsights
+  return Object.fromEntries(METRICS.map(n => [n, insightValue(data, n)])) as PostInsights
 }
-
-/** Codes 10 and 200: the app or token lacks a permission, here threads_manage_insights. */
-export const isMissingPermission = (e: unknown) => e instanceof ThreadsApiError && (e.code === 10 || e.code === 200)
-
-/** Code 100/33, "Object with ID ... does not exist": the post was deleted on Threads. */
-export const isDeletedOnThreads = (e: unknown) =>
-  e instanceof ThreadsApiError && e.code === 100 && (e.subcode === 33 || /does not exist/i.test(e.message))
 
 /** Documented lifetime of a long-lived Threads token, used if Meta omits expires_in. */
 export const LONG_LIVED_SEC = 60 * 24 * 3600
@@ -278,7 +161,7 @@ export async function refreshLongLivedToken(token: string): Promise<{ token: str
   }))
   const data = await res.json().catch(() => ({}))
   if (!res.ok || !data.access_token)
-    throw new ThreadsApiError(`Threads token refresh: ${data.error?.message ?? `HTTP ${res.status}`}`, data.error?.code)
+    throw new MetaApiError(`Threads token refresh: ${data.error?.message ?? `HTTP ${res.status}`}`, data.error?.code)
   return {
     token: data.access_token,
     expiresAt: new Date(Date.now() + (Number(data.expires_in) || LONG_LIVED_SEC) * 1000).toISOString(),
@@ -301,3 +184,74 @@ export async function fetchProfile(token: string): Promise<{ id: string; usernam
   return { id: data.id, username: data.username ?? '' }
 }
 
+const SCOPES = 'threads_basic,threads_content_publish,threads_manage_replies,threads_delete,threads_manage_insights'
+
+/** Threads: 500 characters a post, longer text as a self-reply chain, 60-day tokens refreshed weekly. */
+export const threads: Adapter = {
+  label: 'Threads',
+  missingEnv: () => ['META_THREADS_APP_ID', 'META_THREADS_APP_SECRET', 'THREADS_REDIRECT_URI'].filter(k => !process.env[k]),
+
+  authorizeUrl({ state, redirectUri }) {
+    const url = new URL('https://threads.net/oauth/authorize')
+    url.searchParams.set('client_id', process.env.META_THREADS_APP_ID ?? '')
+    url.searchParams.set('redirect_uri', redirectUri)
+    url.searchParams.set('scope', SCOPES)
+    url.searchParams.set('response_type', 'code')
+    url.searchParams.set('state', state)
+    return url.toString()
+  },
+
+  async connect({ code, redirectUri }) {
+    const appSecret = process.env.META_THREADS_APP_SECRET ?? ''
+    const shortRes = await fetch('https://graph.threads.net/oauth/access_token', {
+      method: 'POST',
+      body: new URLSearchParams({
+        client_id: process.env.META_THREADS_APP_ID ?? '',
+        client_secret: appSecret,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+        code,
+      }),
+    })
+    const short = await shortRes.json().catch(() => ({}))
+    if (!shortRes.ok || !short.access_token)
+      throw new Error(`Threads short token: ${short.error?.message ?? short.error_message ?? `HTTP ${shortRes.status}`}`)
+
+    // A short token dies within an hour, so never store one: every later publish would fail.
+    const longRes = await fetch('https://graph.threads.net/access_token?' + new URLSearchParams({
+      grant_type: 'th_exchange_token',
+      client_secret: appSecret,
+      access_token: short.access_token,
+    }))
+    const long = await longRes.json().catch(() => ({}))
+    if (!longRes.ok || !long.access_token) {
+      console.error('Threads long-lived token exchange failed:', JSON.stringify({ status: longRes.status, error: long.error ?? null }))
+      throw new Error(
+        `Gagal menukar ke token 60 hari: ${long.error?.message ?? `HTTP ${longRes.status}`}. ` +
+        'Akun tidak disimpan; periksa META_THREADS_APP_SECRET lalu hubungkan ulang.',
+      )
+    }
+
+    const profile = await fetchProfile(long.access_token)
+    return [{
+      external_id: profile.id,
+      username: profile.username,
+      access_token: long.access_token,
+      token_expires_at: new Date(Date.now() + (Number(long.expires_in) || LONG_LIVED_SEC) * 1000).toISOString(),
+    }]
+  },
+
+  async publish(job, a) {
+    return publishToThreads({
+      text: job.text,
+      imageUrl: job.imageUrl ? await rehostImage(job.imageUrl) : undefined,
+      videoUrl: job.videoUrl,
+      userId: a.external_id,
+      token: a.token,
+    })
+  },
+
+  fetchInsights: (mediaId, a) => fetchPostInsights(mediaId, a.token),
+  refreshLongLived: refreshLongLivedToken,
+  deletePosts: deleteThreadsPosts,
+}

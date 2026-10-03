@@ -268,13 +268,14 @@ const now = Date.now()
 const gap = 30 * 60_000
 check('toSqlTime matches scheduled_at format', /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(db.toSqlTime(now)))
 // 'x' and 'y' wait at +60 min: more than one gap away, so not part of the train yet
-check('tail stays at now across a long gap', db.queueTail(gap, now) === now)
+check('tail stays at now across a long gap', db.queueTail(gap, acc, now) === now)
 db.queuePost({ account_id: acc, caption: 'train 1', kind: 'news', scheduled_at: db.toSqlTime(now + 20 * 60_000) })
 db.queuePost({ account_id: acc, caption: 'train 2', kind: 'news', scheduled_at: db.toSqlTime(now + 45 * 60_000) })
 const futureMs = Date.parse(`${future.replace(' ', 'T')}Z`)
-check('tail follows the train to its last slot', db.queueTail(gap, now) === futureMs)
+check('tail follows the train to its last slot', db.queueTail(gap, acc, now) === futureMs)
 db.queuePost({ account_id: acc, caption: 'parked', kind: 'news', scheduled_at: db.toSqlTime(now + 3 * 86_400_000) })
-check('a post parked days ahead does not move the tail', db.queueTail(gap, now) === futureMs)
+check('a post parked days ahead does not move the tail', db.queueTail(gap, acc, now) === futureMs)
+check("another account's train does not move this one", db.queueTail(gap, acc + 1000, now) === now)
 const vid = db.queuePost({ account_id: acc, caption: 'video', video_url: 'https://v/1.mp4', kind: 'news', scheduled_at: future })!
 check('video post stored', db.listPosts().find(p => p.id === vid)?.video_url === 'https://v/1.mp4')
 
@@ -294,5 +295,60 @@ const s = db.stats()
 check('stats count accounts', s.accounts === 0)
 check('stats count published', s.published === 1)
 
+// --- multi-platform: routing per account, one claim per account ---
+check('accounts from before routing take both kinds',
+  db.listAccounts().every(a => a.auto_news === 1 && a.auto_affiliate === 1))
+db.setAccountEnabled(acc, true)
+// The user's example: an affiliate-only account, one that takes both, one that takes news only.
+const ig = db.upsertAccount({ platform: 'instagram', external_id: 'ig1', username: 'insta', access_token: 'ig-token',
+  token_expires_at: new Date(Date.now() + 10 * 86_400_000).toISOString() })
+const fb = db.upsertAccount({ platform: 'facebook', external_id: 'page1', username: 'Page', access_token: 'page-token' })
+const fb2 = db.upsertAccount({ platform: 'facebook', external_id: 'page2', username: 'News Page', access_token: 'page-token-2' })
+db.setAccountRouting(ig, { auto_news: false })
+db.setAccountRouting(fb2, { auto_affiliate: false })
+const ids = (as: { id: number }[]) => as.map(a => a.id).sort((a, b) => a - b).join()
+check('news goes to accounts that take news', ids(db.routeTargets('news')) === ids([{ id: acc }, { id: fb }, { id: fb2 }]))
+check('affiliate goes to accounts that take affiliate', ids(db.routeTargets('affiliate')) === ids([{ id: acc }, { id: ig }, { id: fb }]))
+db.setAccountRouting(ig, { auto_affiliate: false })
+check('routing changes only the kind given', !db.routeTargets('affiliate').some(a => a.id === ig) && db.listAccounts().find(a => a.id === ig)?.auto_news === 0)
+db.setAccountEnabled(fb, false)
+check('a disabled account takes nothing', !db.routeTargets('news').some(a => a.id === fb))
+db.setAccountEnabled(fb, true)
+db.upsertAccount({ platform: 'instagram', external_id: 'ig1', username: 'insta', access_token: 'ig-token-2' })
+check('a reconnect keeps routing', db.listAccounts().find(a => a.id === ig)?.auto_news === 0)
+check('credentials carry their platform', db.getAccountToken(fb2)?.platform === 'facebook' && db.getAccountToken(fb2)?.token === 'page-token-2')
+const dueIds = () => db.accountsDueForRefresh().map(a => a.id)
+db.getDb().prepare('UPDATE accounts SET token_checked_at = NULL').run()
+check('only 60-day tokens are refreshed on schedule', dueIds().includes(ig) && !dueIds().includes(fb))
+
+// Each account publishes its own oldest due post, side by side.
+db.getDb().prepare("UPDATE posts SET status = 'draft' WHERE status IN ('scheduled', 'publishing')").run()
+const q = (account_id: number, caption: string) => db.queuePost({ account_id, caption, kind: 'affiliate', scheduled_at: past })!
+const t1 = q(acc, 'threads 1'), t2 = q(acc, 'threads 2'), i1 = q(ig, 'ig 1'), f1 = q(fb2, 'fb 1')
+const batch = db.claimDuePosts()
+check('one due post per account per tick', ids(batch) === ids([{ id: t1 }, { id: i1 }, { id: f1 }]) && !batch.some(p => p.id === t2))
+check('the next tick takes the rest', db.claimDuePosts().map(p => p.id).join() === String(t2))
+db.markTokenInvalid(ig)
+const i2 = q(ig, 'ig 2')
+check('a paused account does not hold up the others', !db.claimDuePosts().some(p => p.id === i2))
+db.upsertAccount({ platform: 'instagram', external_id: 'ig1', username: 'insta', access_token: 'ig-token-3' })
+check('a reconnect lifts the pause', db.claimDuePosts().map(p => p.id).join() === String(i2))
+db.deferPost(i2, 60, 'daily cap')
+const i2Row = db.getDb().prepare('SELECT status, attempts, scheduled_at FROM posts WHERE id = ?').get(i2) as { status: string; attempts: number; scheduled_at: string }
+check('a deferred post waits without spending an attempt',
+  i2Row.status === 'scheduled' && i2Row.attempts === 0 && i2Row.scheduled_at > db.toSqlTime(Date.now() + 59 * 60_000))
+
+// Performa per platform
+const tp = db.recordPublishedPost({ account_id: acc, caption: 'on threads', kind: 'news', external_ids: ['tp'] })
+const fp = db.recordPublishedPost({ account_id: fb2, caption: 'on facebook', kind: 'news', external_ids: ['fp'] })
+db.saveMetrics(tp, { views: 100, likes: 1, replies: 0, reposts: 0, quotes: 0, shares: 0 })
+db.saveMetrics(fp, { views: 900, likes: 9, replies: 0, reposts: 0, quotes: 0, shares: 0 })
+const onFb = db.insightsSummary(7, null, 'facebook').by_kind.news
+check('performa filters by platform', onFb?.views === 900 && onFb?.posts === 1)
+check('performa without platform covers all', (db.insightsSummary(7).by_kind.news?.views ?? 0) >= 1000)
+db.getDb().prepare('DELETE FROM post_metrics WHERE post_id = ?').run(fp)
+check('a facebook post is read like any other', db.postsNeedingInsights(500).find(p => p.id === fp)?.platform === 'facebook')
+check('an account waiting out a limit is skipped', !db.postsNeedingInsights(500, [acc]).some(p => p.account_id === acc))
+
 cleanup()
-console.log(`OK — ${n} assertions passed (crypto, kind migration, accounts, token refresh, dedup, atomic claim, retry backoff, token pause, insights, disabled-account guard, queue tail, pages)`)
+console.log(`OK — ${n} assertions passed (crypto, kind migration, accounts, token refresh, dedup, atomic claim, retry backoff, token pause, insights, disabled-account guard, queue tail, pages, routing, per-account claims, platform performa)`)

@@ -3,7 +3,9 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { encrypt, decrypt } from './crypto'
 
-export type Platform = 'threads' | 'facebook'
+export const PLATFORMS = ['threads', 'instagram', 'facebook'] as const
+export type Platform = (typeof PLATFORMS)[number]
+export const isPlatform = (v: unknown): v is Platform => PLATFORMS.includes(v as Platform)
 export type PostStatus = 'draft' | 'scheduled' | 'publishing' | 'published' | 'failed'
 export type PostKind = 'news' | 'affiliate'
 export const POST_KINDS: readonly PostKind[] = ['news', 'affiliate']
@@ -17,9 +19,12 @@ export type Account = {
   external_id: string
   username: string
   token_expires_at: string | null
-  /** Set when Threads rejected the token; the account's queue waits until a reconnect or refresh. */
+  /** Set when the platform rejected the token; the account's queue waits until a reconnect or refresh. */
   token_invalid_at: string | null
   enabled: number
+  /** Whether posts sent without an account (Hermes) land here, per kind. */
+  auto_news: number
+  auto_affiliate: number
 }
 
 export type Post = {
@@ -92,9 +97,9 @@ export function getDb(): DatabaseSync {
     );
     CREATE INDEX IF NOT EXISTS idx_events_recent ON agent_events (created_at DESC);
 
-    -- latest Threads insights of a published post's root. NULL metrics = never read;
+    -- latest insights of a published post's root, read from its platform. NULL metrics = never read;
     -- error = the last read failed (the metrics from before it stay);
-    -- gone_at = Threads said the post no longer exists, so it is never read again
+    -- gone_at = the platform said the post no longer exists, so it is never read again
     CREATE TABLE IF NOT EXISTS post_metrics (
       post_id    INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,
       views      INTEGER,
@@ -115,6 +120,9 @@ export function getDb(): DatabaseSync {
   try { db.exec('ALTER TABLE accounts ADD COLUMN token_checked_at TEXT') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE accounts ADD COLUMN token_invalid_at TEXT') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE post_metrics ADD COLUMN gone_at TEXT') } catch { /* already migrated */ }
+  // auto_* route posts that name no account. Existing accounts keep receiving everything.
+  try { db.exec('ALTER TABLE accounts ADD COLUMN auto_news INTEGER NOT NULL DEFAULT 1') } catch { /* already migrated */ }
+  try { db.exec('ALTER TABLE accounts ADD COLUMN auto_affiliate INTEGER NOT NULL DEFAULT 1') } catch { /* already migrated */ }
   // Rows from before the column: news always carried its article URL, affiliate never did.
   // Column and backfill land together, so a failed upgrade never leaves every row marked news.
   const cols = db.prepare('PRAGMA table_info(posts)').all() as { name: string }[]
@@ -138,6 +146,7 @@ export function getDb(): DatabaseSync {
 
 // --- accounts ---------------------------------------------------------------
 
+/** A reconnect replaces the token and lifts a pause, but keeps the account's routing. */
 export function upsertAccount(a: {
   platform: Platform; external_id: string; username: string
   access_token: string; token_expires_at?: string | null
@@ -159,39 +168,64 @@ export function upsertAccount(a: {
 
 export function listAccounts(): Account[] {
   return getDb().prepare(
-    `SELECT id, platform, external_id, username, token_expires_at, token_invalid_at, enabled
+    `SELECT id, platform, external_id, username, token_expires_at, token_invalid_at, enabled, auto_news, auto_affiliate
      FROM accounts ORDER BY id`
   ).all() as Account[]
 }
 
-/** Decrypts on read. Never log or return this over HTTP. */
-export function getAccountToken(id: number): { external_id: string; token: string } | null {
+export type AccountCredentials = {
+  id: number; platform: Platform; external_id: string; username: string
+  token: string; token_expires_at: string | null
+}
+
+/** Decrypts on read. Never log or return this over HTTP. Null when missing or disabled. */
+export function getAccountToken(id: number): AccountCredentials | null {
   const row = getDb().prepare(
-    'SELECT external_id, access_token FROM accounts WHERE id = ? AND enabled = 1'
-  ).get(id) as { external_id: string; access_token: string } | undefined
-  return row ? { external_id: row.external_id, token: decrypt(row.access_token) } : null
+    `SELECT id, platform, external_id, username, access_token, token_expires_at
+     FROM accounts WHERE id = ? AND enabled = 1`
+  ).get(id) as (Omit<AccountCredentials, 'token'> & { access_token: string }) | undefined
+  if (!row) return null
+  const { access_token, ...rest } = row
+  return { ...rest, token: decrypt(access_token) }
 }
 
 export function setAccountEnabled(id: number, enabled: boolean) {
   getDb().prepare('UPDATE accounts SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id)
 }
 
+/** Which kinds land on this account when a post names no account. Unset fields stay. */
+export function setAccountRouting(id: number, r: { auto_news?: boolean; auto_affiliate?: boolean }) {
+  getDb().prepare(`
+    UPDATE accounts SET auto_news = COALESCE(?, auto_news), auto_affiliate = COALESCE(?, auto_affiliate) WHERE id = ?
+  `).run(r.auto_news == null ? null : Number(r.auto_news), r.auto_affiliate == null ? null : Number(r.auto_affiliate), id)
+}
+
+/** Enabled accounts that take posts of this kind when the post names no account. */
+export function routeTargets(kind: PostKind): Account[] {
+  return listAccounts().filter(a => a.enabled && (kind === 'news' ? a.auto_news : a.auto_affiliate))
+}
+
 /** A token is refreshed once it has under this many days left: about weekly, as a fresh one has 60. */
 export const REFRESH_DAYS_LEFT = 53
+
+/** Platforms whose 60-day token is traded for a fresh one before it runs out. */
+export const LONG_LIVED_PLATFORMS: readonly Platform[] = ['threads', 'instagram']
 
 /**
  * Enabled accounts whose token should be refreshed now, decrypted. One that
  * was tried in the last 12 hours waits, so a failing refresh is not retried every tick.
  * token_expires_at is ISO ('T', 'Z'), so it is compared through datetime().
+ * Only 60-day tokens: Facebook Page tokens do not expire.
  */
-export function accountsDueForRefresh(): { id: number; username: string; token: string }[] {
+export function accountsDueForRefresh(): { id: number; platform: Platform; username: string; token: string }[] {
   const rows = getDb().prepare(`
-    SELECT id, username, access_token FROM accounts
+    SELECT id, platform, username, access_token FROM accounts
     WHERE enabled = 1 AND token_invalid_at IS NULL
+      AND platform IN (${LONG_LIVED_PLATFORMS.map(() => '?').join(', ')})
       AND (token_expires_at IS NULL OR datetime(token_expires_at) < datetime('now', ?))
       AND (token_checked_at IS NULL OR token_checked_at < datetime('now', '-12 hours'))
-  `).all(`+${REFRESH_DAYS_LEFT} days`) as { id: number; username: string; access_token: string }[]
-  return rows.map(r => ({ id: r.id, username: r.username, token: decrypt(r.access_token) }))
+  `).all(...LONG_LIVED_PLATFORMS, `+${REFRESH_DAYS_LEFT} days`) as { id: number; platform: Platform; username: string; access_token: string }[]
+  return rows.map(r => ({ id: r.id, platform: r.platform, username: r.username, token: decrypt(r.access_token) }))
 }
 
 export function markTokenChecked(id: number) {
@@ -241,17 +275,17 @@ export function toSqlTime(ms: number): string {
 }
 
 /**
- * End of the queue train: the last pending slot reachable from now without a
- * gap longer than maxGapMs. New batches line up after it instead of on top of
- * it. A lone post parked days ahead is not part of the train, so it cannot
- * push new batches back to its date.
+ * End of an account's queue train: the last pending slot reachable from now
+ * without a gap longer than maxGapMs. New batches line up after it instead of
+ * on top of it. A lone post parked days ahead is not part of the train, so it
+ * cannot push new batches back to its date. Each account keeps its own rhythm.
  */
-export function queueTail(maxGapMs: number, now = Date.now()): number {
+export function queueTail(maxGapMs: number, accountId: number, now = Date.now()): number {
   const slots = getDb().prepare(`
     SELECT scheduled_at FROM posts
-    WHERE status IN ('scheduled', 'publishing') AND scheduled_at > ?
+    WHERE account_id = ? AND status IN ('scheduled', 'publishing') AND scheduled_at > ?
     ORDER BY scheduled_at
-  `).all(toSqlTime(now)) as { scheduled_at: string }[]
+  `).all(accountId, toSqlTime(now)) as { scheduled_at: string }[]
   let tail = now
   for (const { scheduled_at } of slots) {
     const t = Date.parse(`${scheduled_at.replace(' ', 'T')}Z`)
@@ -274,17 +308,17 @@ export function recoverStalePublishing() {
   getDb().prepare(`
     UPDATE posts
     SET status = 'failed', retryable = 1,
-        error = 'stuck while publishing (worker stopped mid-send); check Threads for parts that went out. ' || COALESCE(error, '')
+        error = 'stuck while publishing (worker stopped mid-send); check the platform for parts that went out. ' || COALESCE(error, '')
     WHERE status = 'publishing'
       AND (claimed_at IS NULL OR claimed_at < datetime('now', ?))
   `).run(`-${STALE_PUBLISHING_MIN} minutes`)
 }
 
 /**
- * Atomically claim the oldest due post so two workers can't publish it twice.
- * Returns null when nothing is due.
+ * Atomically claim the oldest due post so two workers can't publish it twice,
+ * skipping the accounts in `except`. Returns null when nothing is due.
  */
-export function claimDuePost(): Post | null {
+export function claimDuePost(except: number[] = []): Post | null {
   recoverStalePublishing()
   const row = getDb().prepare(`
     UPDATE posts SET status = 'publishing', attempts = attempts + 1, claimed_at = datetime('now')
@@ -292,11 +326,22 @@ export function claimDuePost(): Post | null {
       SELECT p.id FROM posts p
       JOIN accounts a ON a.id = p.account_id AND a.enabled = 1 AND a.token_invalid_at IS NULL
       WHERE p.status = 'scheduled' AND p.scheduled_at <= datetime('now')
+        AND p.account_id NOT IN (SELECT value FROM json_each(?))
       ORDER BY p.scheduled_at LIMIT 1
     )
     RETURNING *
-  `).get() as Post | undefined
+  `).get(JSON.stringify(except)) as Post | undefined
   return row ?? null
+}
+
+/**
+ * The oldest due post of each account, claimed. Accounts publish side by side,
+ * so one slow platform (video processing, a long chain) does not hold up the rest.
+ */
+export function claimDuePosts(): Post[] {
+  const claimed: Post[] = []
+  for (let p = claimDuePost(); p; p = claimDuePost(claimed.map(c => c.account_id))) claimed.push(p)
+  return claimed
 }
 
 export function markPublished(id: number, externalIds: string[]) {
@@ -361,6 +406,18 @@ export function releasePost(id: number, error: string) {
     UPDATE posts SET status = 'scheduled', attempts = MAX(attempts - 1, 0), claimed_at = NULL, error = ?
     WHERE id = ?
   `).run(error.slice(0, 1000), id)
+}
+
+/**
+ * Hands a claimed post back to wait `minutes`, for a limit the platform will lift
+ * (Instagram's daily publishing cap, a rate limit). The attempt is not counted.
+ */
+export function deferPost(id: number, minutes: number, error: string) {
+  getDb().prepare(`
+    UPDATE posts SET status = 'scheduled', attempts = MAX(attempts - 1, 0), claimed_at = NULL, error = ?,
+                     scheduled_at = datetime('now', ?)
+    WHERE id = ?
+  `).run(error.slice(0, 1000), `+${minutes} minutes`, id)
 }
 
 /**
@@ -439,22 +496,23 @@ export function stats(kind: PostKind | null = null) {
  * Then stale readings: every 3 hours in a post's first day, while its numbers still
  * climb, and every 12 hours until it is a week old. After that the last reading stands,
  * unless it failed: a failed reading is retried hourly while the post is under 30 days
- * old, the longest dashboard period. Posts deleted on Threads and accounts with a
- * rejected token are skipped.
+ * old, the longest dashboard period. Posts deleted on their platform and accounts with a
+ * rejected token are skipped, as are accounts in `except` (say, waiting out a missing permission).
  */
-export function postsNeedingInsights(limit: number): { id: number; account_id: number; media_id: string }[] {
+export function postsNeedingInsights(limit: number, except: number[] = []): { id: number; account_id: number; platform: Platform; media_id: string }[] {
   return getDb().prepare(`
-    SELECT p.id, p.account_id, json_extract(p.external_ids, '$[0]') media_id FROM posts p
+    SELECT p.id, p.account_id, a.platform, json_extract(p.external_ids, '$[0]') media_id FROM posts p
     JOIN accounts a ON a.id = p.account_id AND a.enabled = 1 AND a.token_invalid_at IS NULL
     LEFT JOIN post_metrics m ON m.post_id = p.id
     WHERE p.status = 'published' AND json_extract(p.external_ids, '$[0]') IS NOT NULL AND m.gone_at IS NULL
+      AND p.account_id NOT IN (SELECT value FROM json_each(?))
       AND (m.post_id IS NULL
         OR (p.published_at > datetime('now', '-1 day') AND m.fetched_at < datetime('now', '-3 hours'))
         OR (p.published_at > datetime('now', '-7 days') AND m.fetched_at < datetime('now', '-12 hours'))
         OR (m.error IS NOT NULL AND p.published_at > datetime('now', '-30 days') AND m.fetched_at < datetime('now', '-1 hour')))
     ORDER BY m.post_id IS NOT NULL, p.published_at DESC, p.id DESC
     LIMIT ?
-  `).all(limit) as { id: number; account_id: number; media_id: string }[]
+  `).all(JSON.stringify(except), limit) as { id: number; account_id: number; platform: Platform; media_id: string }[]
 }
 
 export function saveMetrics(postId: number, m: Metrics) {
@@ -476,7 +534,7 @@ export function saveMetricsError(postId: number, error: string) {
   `).run(postId, error.slice(0, 500))
 }
 
-/** The post was deleted on Threads: stop reading it and leave it out of the numbers. */
+/** The post was deleted on its platform: stop reading it and leave it out of the numbers. */
 export function saveMetricsGone(postId: number, error: string) {
   getDb().prepare(`
     INSERT INTO post_metrics (post_id, error, fetched_at, gone_at) VALUES (?, ?, datetime('now'), datetime('now'))
@@ -494,15 +552,17 @@ export type RankedPost = Metrics & { id: number; kind: PostKind; caption: string
  * Performance of posts published in the last `days`, per kind (or one kind).
  * covered counts the posts with a reading; averages divide by it, not by posts.
  * errors counts posts whose latest reading failed.
- * gone counts posts deleted on Threads; every other number leaves them out.
+ * gone counts posts deleted on their platform; every other number leaves them out.
+ * platform narrows it to one platform's accounts; views are not comparable across platforms.
  * engagement_rate = (likes + replies + reposts + quotes + shares) / views.
  * top/bottom rank across the kinds asked for; top_by_kind/bottom_by_kind rank each.
  * bottom skips posts under a day old, which have not had their audience yet.
  */
-export function insightsSummary(days: number, kind: PostKind | null = null) {
+export function insightsSummary(days: number, kind: PostKind | null = null, platform: Platform | null = null) {
   const since = `-${days} days`
-  const where = "p.status = 'published' AND p.published_at > datetime('now', ?) AND (? IS NULL OR p.kind = ?)"
-  // m holds readings of posts still on Threads, g marks the deleted ones.
+  const where = `p.status = 'published' AND p.published_at > datetime('now', ?) AND (? IS NULL OR p.kind = ?)
+    AND (? IS NULL OR p.account_id IN (SELECT id FROM accounts WHERE platform = ?))`
+  // m holds readings of posts still up, g marks the deleted ones.
   const rows = getDb().prepare(`
     SELECT p.kind, COUNT(*) - COUNT(g.post_id) posts, COUNT(g.post_id) gone, COUNT(m.views) covered, COUNT(m.error) errors,
       COALESCE(SUM(m.views), 0) views, COALESCE(SUM(m.likes), 0) likes, COALESCE(SUM(m.replies), 0) replies,
@@ -511,7 +571,7 @@ export function insightsSummary(days: number, kind: PostKind | null = null) {
     LEFT JOIN post_metrics m ON m.post_id = p.id AND m.gone_at IS NULL
     LEFT JOIN post_metrics g ON g.post_id = p.id AND g.gone_at IS NOT NULL
     WHERE ${where} GROUP BY p.kind
-  `).all(since, kind, kind) as (Metrics & { kind: PostKind; posts: number; covered: number; errors: number; gone: number })[]
+  `).all(since, kind, kind, platform, platform) as (Metrics & { kind: PostKind; posts: number; covered: number; errors: number; gone: number })[]
   const by_kind: Partial<Record<PostKind, KindSummary>> = {}
   for (const { kind: k, ...r } of rows) {
     const engaged = r.likes + r.replies + r.reposts + r.quotes + r.shares
@@ -529,12 +589,12 @@ export function insightsSummary(days: number, kind: PostKind | null = null) {
     WHERE ${where} AND m.views IS NOT NULL AND m.gone_at IS NULL
       ${order === 'ASC' ? "AND p.published_at < datetime('now', '-1 day')" : ''}
     ORDER BY m.views ${order}, p.id DESC LIMIT 5
-  `).all(since, k, k) as RankedPost[]
+  `).all(since, k, k, platform, platform) as RankedPost[]
   const perKind = (order: 'ASC' | 'DESC') => Object.fromEntries(
     POST_KINDS.filter(k => !kind || k === kind).map(k => [k, ranked(k, order)]),
   ) as Partial<Record<PostKind, RankedPost[]>>
   return {
-    days, kind, by_kind,
+    days, kind, platform, by_kind,
     top: ranked(kind, 'DESC'),
     bottom: ranked(kind, 'ASC'),
     top_by_kind: perKind('DESC'),

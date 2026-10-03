@@ -5,19 +5,21 @@ const PUBLIC = [
   '/login',
   '/api/login',
   '/api/health',                     // uptime probes and container healthchecks
-  '/api/auth/threads/callback',      // browser returns from Meta; the route checks session + OAuth state
   '/api/auth/threads/deauthorize',   // called server-to-server by Meta
   '/api/auth/threads/delete',        // called server-to-server by Meta
 ]
 
+/** The browser returns here from Meta; the route checks session + OAuth state itself. */
+const OAUTH_CALLBACK = /^\/api\/auth\/[a-z]+\/callback$/
+
 /**
  * Everything is private by default, including starting an OAuth connect.
  * Meta's server-to-server callbacks stay public because Meta cannot carry our
- * session cookie; the OAuth callback verifies session and state itself.
+ * session cookie; the OAuth callbacks verify session and state themselves.
  */
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
-  if (PUBLIC.some(p => pathname.startsWith(p))) return NextResponse.next()
+  if (PUBLIC.some(p => pathname.startsWith(p)) || OAUTH_CALLBACK.test(pathname)) return NextResponse.next()
 
   // Bearer key for the cron poster — verified properly inside the route.
   if (request.headers.get('authorization')?.startsWith('Bearer ')) return NextResponse.next()

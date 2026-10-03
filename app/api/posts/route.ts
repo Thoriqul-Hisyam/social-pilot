@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { isPostKind, pagePosts, type PostKind, queuePost, queueTail, stats, listAccounts, toSqlTime } from '@/lib/db'
+import { type Account, isPostKind, pagePosts, type PostKind, queuePost, queueTail, routeTargets, stats, listAccounts, toSqlTime } from '@/lib/db'
 import { hasValidApiKey, hasValidSession, unauthorized } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -54,9 +54,13 @@ export async function GET(request: NextRequest) {
 }
 
 /**
- * Queue one or many posts. Each item is staggered by a random 5-30 min gap
- * after the latest pending slot, so a batch never fires all at once.
+ * Queue one or many posts. An item with accountId goes to that account; one
+ * without goes to every enabled account set to take its kind (auto_news,
+ * auto_affiliate), and is reported in no_target when none does.
+ * Each account keeps its own rhythm: its posts are staggered by a random
+ * 5-30 min gap after its latest pending slot, so a batch never fires all at once.
  * Every item needs kind "news" or "affiliate"; one without rejects the batch.
+ * captions: {instagram: "...", facebook: "..."} optionally replaces caption on those platforms.
  * Duplicate news sourceUrl for the same account is skipped, not an error;
  * affiliate may repeat.
  */
@@ -71,8 +75,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'items must be 1-50 entries' }, { status: 400 })
 
   const accounts = listAccounts()
-  const enabled = accounts.filter(a => a.enabled)
-  const defaultAccount = enabled.length === 1 ? enabled[0].id : null
 
   // Validate the whole batch up front, so nothing is half-queued and no post slips through without media or kind.
   const noMedia = items.flatMap((raw, i) => mediaOf(raw as Record<string, unknown>) ? [] : [i])
@@ -92,16 +94,23 @@ export async function POST(request: NextRequest) {
     }, { status: 400 })
 
   const posts = []
-  for (const raw of items) {
+  const noTarget: number[] = []
+  for (const [i, raw] of items.entries()) {
     const it = raw as Record<string, unknown>
     const caption = typeof it.caption === 'string' ? it.caption.trim() : ''
     if (!caption) return NextResponse.json({ error: 'caption required for every item' }, { status: 400 })
+    const captions = it.captions && typeof it.captions === 'object' ? it.captions as Record<string, unknown> : {}
+    const kind = it.kind as PostKind
 
-    const accountId = typeof it.accountId === 'number' ? it.accountId : defaultAccount
-    if (accountId === null)
-      return NextResponse.json({ error: 'accountId required when multiple accounts exist' }, { status: 400 })
-    if (!accounts.some(a => a.id === accountId))
-      return NextResponse.json({ error: `account ${accountId} not found` }, { status: 400 })
+    let targets: Account[]
+    if (it.accountId != null) {
+      const account = accounts.find(a => a.id === it.accountId)
+      if (!account) return NextResponse.json({ error: `account ${it.accountId} not found` }, { status: 400 })
+      targets = [account]
+    } else {
+      targets = routeTargets(kind)
+      if (!targets.length) { noTarget.push(i); continue }
+    }
 
     // Caller may pin scheduled_at (e.g. a migration script with already-due articles):
     // ISO string or 'YYYY-MM-DD HH:MM:SS'. Otherwise it is staggered below.
@@ -110,27 +119,37 @@ export async function POST(request: NextRequest) {
     if (pinned && !scheduledAt)
       return NextResponse.json({ error: `scheduledAt is not a valid date: ${pinned}` }, { status: 400 })
 
-    posts.push({
-      account_id: accountId,
-      caption,
-      ...mediaOf(it)!,
-      source_url: typeof it.sourceUrl === 'string' ? it.sourceUrl : null,
-      kind: it.kind as PostKind,
-      scheduledAt,
-      label: String(it.sourceUrl ?? caption.slice(0, 40)),
-    })
+    for (const account of targets) {
+      const own = captions[account.platform]
+      posts.push({
+        account_id: account.id,
+        caption: typeof own === 'string' && own.trim() ? own.trim() : caption,
+        ...mediaOf(it)!,
+        source_url: typeof it.sourceUrl === 'string' ? it.sourceUrl : null,
+        kind,
+        scheduledAt,
+        label: String(it.sourceUrl ?? caption.slice(0, 40)),
+      })
+    }
   }
 
-  let cursor = queueTail(MAX_GAP_MIN * 60_000)
+  const cursors = new Map<number, number>()
   const queued: number[] = []
-  const skipped: string[] = []
+  // Labels stay as before, one per item, even when only some of its accounts had it already.
+  const skipped = new Set<string>()
 
   for (const { scheduledAt, label, ...post } of posts) {
-    if (!scheduledAt) cursor += (MIN_GAP_MIN + Math.random() * (MAX_GAP_MIN - MIN_GAP_MIN)) * 60_000
-    const id = queuePost({ ...post, scheduled_at: scheduledAt ?? toSqlTime(cursor) })
-    if (id === null) skipped.push(label)
+    let at = scheduledAt
+    if (!at) {
+      const cursor = (cursors.get(post.account_id) ?? queueTail(MAX_GAP_MIN * 60_000, post.account_id))
+        + (MIN_GAP_MIN + Math.random() * (MAX_GAP_MIN - MIN_GAP_MIN)) * 60_000
+      cursors.set(post.account_id, cursor)
+      at = toSqlTime(cursor)
+    }
+    const id = queuePost({ ...post, scheduled_at: at })
+    if (id === null) skipped.add(label)
     else queued.push(id)
   }
 
-  return NextResponse.json({ queued: queued.length, ids: queued, skipped_duplicates: skipped })
+  return NextResponse.json({ queued: queued.length, ids: queued, skipped_duplicates: [...skipped], no_target: noTarget })
 }

@@ -1,5 +1,6 @@
-import { getAccountToken, logEvent, postsNeedingInsights, saveMetrics, saveMetricsError, saveMetricsGone } from './db'
-import { fetchPostInsights, isDeletedOnThreads, isInvalidToken, isMissingPermission, NetworkError } from './threads'
+import { getAccountToken, logEvent, postsNeedingInsights, saveMetrics, saveMetricsError, saveMetricsGone, type AccountCredentials } from './db'
+import { isGone, isInvalidToken, isMissingPermission, isRateLimited, NetworkError } from './errors'
+import { ADAPTERS } from './platforms'
 import { pauseForInvalidToken } from './tokens'
 
 /**
@@ -10,44 +11,48 @@ import { pauseForInvalidToken } from './tokens'
 const PER_TICK = 20
 const HOUR_MS = 3_600_000
 
-// Until the account is reconnected with threads_manage_insights, every read fails alike.
-// Wait an hour between tries instead of spending a batch each tick, and say so once.
-let blockedUntil = 0
+// An account whose token lacks the insights permission fails every read alike, as does
+// one over its rate limit. It waits an hour instead of spending a batch each tick.
+const blockedUntil = new Map<number, number>()
 // Per-post failures are stored on the post; the crew feed hears of them at most hourly.
 let lastFailureNotice = 0
 // A dropped connection is the server's, not the post's: nothing is stored, the next tick tries again.
 let lastOfflineNotice = 0
 
 /**
- * Reads Threads insights for the posts that need them. Runs on each worker tick.
- * Sequential, so a missing permission or a dropped connection costs one call, not a batch. Never throws.
+ * Reads insights for the posts that need them, from each post's platform. Runs on
+ * each worker tick. Sequential, so a missing permission or a dropped connection
+ * costs one call, not a batch. Never throws.
  */
 export async function collectInsights(limit = PER_TICK) {
-  if (Date.now() < blockedUntil) return
+  const now = Date.now()
+  for (const [id, until] of blockedUntil) if (until <= now) blockedUntil.delete(id)
   let due: ReturnType<typeof postsNeedingInsights>
-  try { due = postsNeedingInsights(limit) } catch (e) { console.error(`insights: ${e}`); return }
-  const tokens = new Map<number, string | null>()
+  try { due = postsNeedingInsights(limit, [...blockedUntil.keys()]) } catch (e) { console.error(`insights: ${e}`); return }
+  const accounts = new Map<number, AccountCredentials | null>()
   const failed: string[] = []
   const gone: string[] = []
   let offline: unknown = null
   for (const p of due) {
-    if (!tokens.has(p.account_id)) tokens.set(p.account_id, getAccountToken(p.account_id)?.token ?? null)
-    const token = tokens.get(p.account_id)
-    if (!token) continue
+    const adapter = ADAPTERS[p.platform]
+    if (!adapter || blockedUntil.has(p.account_id)) continue
     try {
-      saveMetrics(p.id, await fetchPostInsights(p.media_id, token))
+      if (!accounts.has(p.account_id)) accounts.set(p.account_id, getAccountToken(p.account_id))
+      const account = accounts.get(p.account_id)
+      if (!account) continue
+      saveMetrics(p.id, await adapter.fetchInsights(p.media_id, account))
     } catch (e) {
-      if (isMissingPermission(e)) {
-        blockedUntil = Date.now() + HOUR_MS
-        logEvent({
+      if (isMissingPermission(e) || isRateLimited(e)) {
+        blockedUntil.set(p.account_id, Date.now() + HOUR_MS)
+        if (isMissingPermission(e)) logEvent({
           agent: 'publisher', to_agent: 'observer', kind: 'error',
-          message: `Insight belum bisa dibaca: token akun belum membawa izin threads_manage_insights. Hubungkan ulang akun (Tambah akun Threads) dan setujui izin insight. ${e}`,
+          message: `Insight ${adapter.label} belum bisa dibaca: token akun belum membawa izin insight. Hubungkan ulang akun dan setujui izin insight. ${e}`,
         })
-        return
+        continue
       }
-      if (isInvalidToken(e)) { pauseForInvalidToken(p.account_id, e); tokens.set(p.account_id, null); continue }
+      if (isInvalidToken(e)) { pauseForInvalidToken(p.account_id, e); accounts.set(p.account_id, null); continue }
       if (e instanceof NetworkError) { offline = e; break }
-      const deleted = isDeletedOnThreads(e)
+      const deleted = isGone(e)
       if (deleted) gone.push(`#${p.id}`)
       else failed.push(`#${p.id}: ${e}`)
       try { (deleted ? saveMetricsGone : saveMetricsError)(p.id, String(e)) } catch (e2) { console.error(`insights: post ${p.id}: ${e2}`) }
@@ -56,7 +61,7 @@ export async function collectInsights(limit = PER_TICK) {
   // Each post is marked once, so this needs no throttle.
   if (gone.length) logEvent({
     agent: 'publisher', to_agent: 'observer', kind: 'info',
-    message: `${gone.length} post sudah dihapus di Threads, tidak dibaca lagi dan tidak dihitung di Performa: ${gone.join(', ')}`,
+    message: `${gone.length} post sudah dihapus di platformnya, tidak dibaca lagi dan tidak dihitung di Performa: ${gone.join(', ')}`,
   })
   if (failed.length && Date.now() - lastFailureNotice > HOUR_MS) {
     lastFailureNotice = Date.now()
@@ -69,7 +74,7 @@ export async function collectInsights(limit = PER_TICK) {
     lastOfflineNotice = Date.now()
     logEvent({
       agent: 'publisher', to_agent: 'observer', kind: 'error',
-      message: `Insight berhenti sementara: server tidak tersambung ke Threads. Tidak ada post yang dihitung gagal; dicoba lagi tiap tick. ${offline}`,
+      message: `Insight berhenti sementara: server tidak tersambung ke platform. Tidak ada post yang dihitung gagal; dicoba lagi tiap tick. ${offline}`,
     })
   }
 }

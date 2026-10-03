@@ -4,7 +4,7 @@ import { publishNow } from '@/lib/publish'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-/** Kept for callers from before multi-platform: like /api/publish, limited to Threads accounts. */
+/** Publishes at once to any connected account: {text, imageUrl|videoUrl, kind, accountId}. */
 export async function POST(request: NextRequest) {
-  return publishNow(request, 'threads')
+  return publishNow(request)
 }

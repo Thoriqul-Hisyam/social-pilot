@@ -40,7 +40,11 @@ export function sniffImage(b: Uint8Array): { type: string; ext: string } | { uns
   return { unsupported: 'not an image' }
 }
 
-async function downloadImage(url: string): Promise<{ body: Uint8Array<ArrayBuffer>; type: string; ext: string }> {
+/**
+ * Downloads an image, checked to be one. With convertible, formats Threads refuses
+ * (WebP, AVIF, GIF) come back with an empty type, for toJpeg to re-encode.
+ */
+async function downloadImage(url: string, convertible = false): Promise<{ body: Uint8Array<ArrayBuffer>; type: string; ext: string }> {
   const src = new URL(url)
   if (src.protocol !== 'https:' && src.protocol !== 'http:') throw new Error(`image download failed: ${src.protocol} URL`)
   const res = await fetch(src, {
@@ -77,6 +81,7 @@ async function downloadImage(url: string): Promise<{ body: Uint8Array<ArrayBuffe
     const got = body.length ? `${body.length} bytes of ${res.headers.get('content-type') ?? 'unknown type'}` : 'an empty body'
     throw new Error(`image download failed: ${src.hostname} sent ${got}, not an image. Does the file exist? ${url}`)
   }
+  if ('unsupported' in kind && convertible) return { body, type: '', ext: '' }
   if ('unsupported' in kind) throw new Error(`unsupported image format (${kind.unsupported}) from ${src.hostname}: Threads takes JPEG or PNG only`)
   return { body, ...kind }
 }
@@ -141,5 +146,51 @@ export async function rehostImage(url: string): Promise<string> {
   const { body, type, ext } = await downloadImage(url)
   const key = `threads/${sha256(body)}.${ext}`
   await putObject(cfg, key, body, type)
+  return `${cfg.publicUrl}/${key}`
+}
+
+/** What a platform accepts: width bounds in px and aspect ratio (width / height) bounds. */
+export type JpegRules = { maxWidth: number; minWidth?: number; minRatio?: number; maxRatio?: number }
+
+/** Instagram takes JPEG only, 4:5 to 1.91:1, 320 to 1440 px wide, up to 8 MB. */
+export const INSTAGRAM_JPEG: JpegRules = { maxWidth: 1440, minWidth: 320, minRatio: 0.8, maxRatio: 1.91 }
+/** Facebook takes up to 4 MB and shows at most 2048 px wide. */
+export const FACEBOOK_JPEG: JpegRules = { maxWidth: 2048 }
+
+/**
+ * Re-encodes an image as an sRGB JPEG within the rules: EXIF rotation applied,
+ * transparency on white, scaled into the width bounds, and padded with white
+ * bars, never cropped, into the ratio bounds. Loaded lazily, so a missing
+ * sharp binary only fails the platforms that need it.
+ */
+export async function toJpeg(body: Uint8Array, r: JpegRules): Promise<Buffer> {
+  const sharp = (await import('sharp')).default
+  const white = { r: 255, g: 255, b: 255, alpha: 1 }
+  const pass = (input: Uint8Array, f: (s: import('sharp').Sharp) => import('sharp').Sharp) =>
+    f(sharp(input)).png({ compressionLevel: 0 }).toBuffer({ resolveWithObject: true })
+  let { data, info } = await pass(body, s => s.rotate().flatten({ background: white }).resize({ width: r.maxWidth, withoutEnlargement: true }))
+  if (r.minWidth && info.width < r.minWidth) ({ data, info } = await pass(data, s => s.resize({ width: r.minWidth })))
+  const ratio = info.width / info.height
+  if (r.maxRatio && ratio > r.maxRatio) {
+    const pad = Math.ceil(info.width / r.maxRatio) - info.height
+    ;({ data, info } = await pass(data, s => s.extend({ top: Math.floor(pad / 2), bottom: Math.ceil(pad / 2), background: white })))
+  } else if (r.minRatio && ratio < r.minRatio) {
+    const pad = Math.ceil(info.height * r.minRatio) - info.width
+    ;({ data, info } = await pass(data, s => s.extend({ left: Math.floor(pad / 2), right: Math.ceil(pad / 2), background: white })))
+  }
+  // Padding a tall image widens it; scale back down, which keeps the ratio.
+  return sharp(data).resize({ width: r.maxWidth, withoutEnlargement: true }).toColourspace('srgb').jpeg({ quality: 88 }).toBuffer()
+}
+
+/**
+ * Copies an image to R2 as a JPEG that meets the platform's rules (Instagram,
+ * Facebook) and returns its public URL. WebP and AVIF sources are converted too.
+ */
+export async function rehostJpeg(url: string, prefix: string, rules: JpegRules): Promise<string> {
+  const cfg = r2Config()
+  const { body } = await downloadImage(url, true)
+  const jpeg = new Uint8Array(await toJpeg(body, rules))
+  const key = `${prefix}/${sha256(jpeg)}.jpg`
+  await putObject(cfg, key, jpeg, 'image/jpeg')
   return `${cfg.publicUrl}/${key}`
 }

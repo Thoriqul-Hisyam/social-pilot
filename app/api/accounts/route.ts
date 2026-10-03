@@ -1,21 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { listAccounts, setAccountEnabled } from '@/lib/db'
+import { listAccounts, setAccountEnabled, setAccountRouting } from '@/lib/db'
+import { platformList } from '@/lib/platforms'
 import { hasValidSession, unauthorized } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
+/** Accounts, plus every platform that can be connected and the env it still lacks. */
 export async function GET(request: NextRequest) {
   if (!hasValidSession(request)) return unauthorized()
-  // token column is never selected — safe to return as-is
-  return NextResponse.json({ accounts: listAccounts() })
+  // token columns are never selected — safe to return as-is
+  return NextResponse.json({ accounts: listAccounts(), platforms: platformList() })
 }
 
+/** {id, enabled?, auto_news?, auto_affiliate?}: any of the three booleans. */
 export async function PATCH(request: NextRequest) {
   if (!hasValidSession(request)) return unauthorized()
-  const { id, enabled } = await request.json().catch(() => ({}))
-  if (typeof id !== 'number' || typeof enabled !== 'boolean')
-    return NextResponse.json({ error: 'id (number) and enabled (boolean) required' }, { status: 400 })
-  setAccountEnabled(id, enabled)
+  const { id, enabled, auto_news, auto_affiliate } = await request.json().catch(() => ({}))
+  const flag = (v: unknown) => v === undefined || typeof v === 'boolean'
+  if (typeof id !== 'number' || !flag(enabled) || !flag(auto_news) || !flag(auto_affiliate)
+    || [enabled, auto_news, auto_affiliate].every(v => v === undefined))
+    return NextResponse.json({ error: 'id (number) and at least one of enabled, auto_news, auto_affiliate (boolean) required' }, { status: 400 })
+  if (enabled !== undefined) setAccountEnabled(id, enabled)
+  if (auto_news !== undefined || auto_affiliate !== undefined) setAccountRouting(id, { auto_news, auto_affiliate })
   return NextResponse.json({ ok: true })
 }

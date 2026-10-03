@@ -1,14 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { deletePost, getAccountToken, liveIdsFromError } from '@/lib/db'
-import { deleteThreadsPosts } from '@/lib/threads'
+import { ADAPTERS } from '@/lib/platforms'
 import { hasValidApiKey, hasValidSession, unauthorized } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 /**
- * Deletes a queued or failed post. Parts of a broken chain that are still live
- * on Threads are deleted too (needs threads_delete); any that can't be come
+ * Deletes a queued or failed post. Parts of a broken Threads chain that are
+ * still live are deleted too (needs threads_delete); any that can't be come
  * back in still_live so they can be removed by hand.
  */
 export async function DELETE(request: NextRequest, context: { params: Promise<{ id: string }> }) {
@@ -21,6 +21,7 @@ export async function DELETE(request: NextRequest, context: { params: Promise<{ 
 
   const live = result.post.status === 'published' ? [] : liveIdsFromError(result.post.error)
   const account = live.length ? getAccountToken(result.post.account_id) : null
-  const stillLive = !live.length ? [] : account ? await deleteThreadsPosts(live, account.token) : live
+  const remove = account ? ADAPTERS[account.platform]?.deletePosts : undefined
+  const stillLive = !live.length ? [] : remove ? await remove(live, account!.token) : live
   return NextResponse.json({ deleted: true, post_id: id, threads_deleted: live.length - stillLive.length, still_live: stillLive })
 }

@@ -1,6 +1,6 @@
 /** Local stand-in for deploy/socialpilot-worker.timer: POSTs /api/worker/tick
  *  every WORKER_INTERVAL_MIN minutes (default 5). A tick publishes at most one
- *  post, so the next one waits for the previous to finish — never overlaps. */
+ *  post per account, so the next one waits for the previous to finish — never overlaps. */
 import { createRequire } from 'node:module'
 
 createRequire(import.meta.url)('@next/env').loadEnvConfig(process.cwd(), false)
@@ -18,8 +18,14 @@ async function tick() {
     const res = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${key}` } })
     const data = await res.json().catch(() => ({}))
     if (data.reason === 'nothing_due') return
-    if (data.published) console.log(`[worker ${stamp()}] post #${data.id} terbit (${data.parts} bagian)`)
-    else console.log(`[worker ${stamp()}] post #${data.id ?? data.post_id ?? '?'} gagal: ${data.error ?? res.status}`)
+    if (!data.results) return console.log(`[worker ${stamp()}] tick gagal: ${data.error ?? res.status}`)
+    for (const r of data.results) {
+      const where = r.platform ? ` ${r.platform}` : ''
+      if (r.published) console.log(`[worker ${stamp()}] post #${r.id} terbit di${where} (${r.parts} bagian)`)
+      else if (r.paused) console.log(`[worker ${stamp()}] post #${r.id} menunggu akun dihubungkan ulang`)
+      else if (r.deferred_min) console.log(`[worker ${stamp()}] post #${r.id} ditunda ${r.deferred_min} menit: batas${where}`)
+      else console.log(`[worker ${stamp()}] post #${r.id}${where} gagal: ${r.error ?? res.status}`)
+    }
   } catch (e) {
     console.log(`[worker ${stamp()}] server belum bisa dihubungi: ${e.cause?.code ?? e.message}`)
   }

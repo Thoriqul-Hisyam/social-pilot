@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { claimDuePost, getAccountToken, logEvent, markFailed, markPublished, releasePost } from '@/lib/db'
-import { ChainBrokenError, isInvalidToken, publishToThreads } from '@/lib/threads'
-import { rehostImage } from '@/lib/media'
-import { pauseForInvalidToken, refreshDueTokens } from '@/lib/tokens'
+import { claimDuePosts } from '@/lib/db'
+import { publishClaimed } from '@/lib/publish'
+import { refreshDueTokens } from '@/lib/tokens'
 import { collectInsights } from '@/lib/insights'
 import { hasValidApiKey, hasValidSession, unauthorized } from '@/lib/auth'
 
@@ -10,12 +9,13 @@ export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 /**
- * Publishes at most one due post per call. Call it on a short cron
- * (every 5 min); the random gaps live in the scheduled_at column, so the
- * tick itself stays dumb and safe to run often.
+ * Publishes at most one due post per account per call, accounts side by side.
+ * Call it on a short cron (every 5 min); the random gaps live in the
+ * scheduled_at column, so the tick itself stays dumb and safe to run often.
  *
  * Returns {published:false, reason:'nothing_due'} when idle — callers should
- * treat that as success and stay silent.
+ * treat that as success and stay silent. Otherwise results holds one entry
+ * per post, and the status is 502 if any of them failed.
  *
  * Token refresh and insight reading ride on the same cron, before the queue,
  * so they run even when nothing is due.
@@ -25,48 +25,10 @@ export async function POST(request: NextRequest) {
 
   await refreshDueTokens()
   await collectInsights()
-  const post = claimDuePost()
-  if (!post) return NextResponse.json({ published: false, reason: 'nothing_due' })
-  logEvent({ agent: 'publisher', to_agent: 'observer', kind: 'working', message: `Mengirim post #${post.id} ke Threads.`, post_id: post.id })
+  const posts = claimDuePosts()
+  if (!posts.length) return NextResponse.json({ published: false, reason: 'nothing_due' })
 
-  const account = getAccountToken(post.account_id)
-  if (!account) {
-    const error = 'account missing or disabled'
-    markFailed(post.id, error, 3, false)
-    logEvent({ agent: 'publisher', to_agent: 'observer', kind: 'error', message: `Post #${post.id} gagal: akun hilang atau nonaktif.`, post_id: post.id })
-    return NextResponse.json({ published: false, post_id: post.id, error, retryable: false, can_retry: false }, { status: 409 })
-  }
-
-  try {
-    const ids = await publishToThreads({
-      text: post.caption,
-      imageUrl: post.image_url ? await rehostImage(post.image_url) : undefined,
-      videoUrl: post.video_url ?? undefined,
-      userId: account.external_id,
-      token: account.token,
-    })
-    markPublished(post.id, ids)
-    logEvent({ agent: 'publisher', to_agent: 'observer', kind: 'done', message: `Post #${post.id} terbit di Threads (${ids.length} bagian).`, post_id: post.id })
-    return NextResponse.json({ published: true, id: post.id, post_ids: ids, parts: ids.length })
-  } catch (e) {
-    const error = String(e)
-    // A rejected token fails every post alike: hold the queue rather than burn their attempts.
-    if (isInvalidToken(e)) {
-      releasePost(post.id, `menunggu akun dihubungkan ulang: ${error}`)
-      pauseForInvalidToken(post.account_id, e)
-      return NextResponse.json({ published: false, id: post.id, error, paused: true }, { status: 409 })
-    }
-    // A broken chain is deleted again, so it can retry from the root. If some parts
-    // could not be deleted, fail at once: a retry would repost them. Retry by hand after deleting.
-    const stuck = e instanceof ChainBrokenError && e.liveIds.length > 0
-    // Setup errors do not pass with time, so fail at once, but keep them retryable by hand for after the fix.
-    const setup = ['missing Threads credentials', 'R2 not configured']
-    const permanent = ['empty post', 'image or video required', 'not both', 'unsupported image format', 'image too large']
-    const retryable = !permanent.some(p => error.includes(p))
-    const needsSetup = setup.some(p => error.includes(p))
-    markFailed(post.id, error, stuck || needsSetup || !retryable ? 1 : 3, retryable)
-    const willRetry = retryable && !stuck && !needsSetup && post.attempts < 3
-    logEvent({ agent: 'publisher', to_agent: 'observer', kind: 'error', message: `Post #${post.id} gagal${willRetry ? ', dicoba lagi' : ''}: ${error}`, post_id: post.id })
-    return NextResponse.json({ published: false, id: post.id, error, retryable, can_retry: willRetry, attempts: post.attempts }, { status: 502 })
-  }
+  const results = await Promise.all(posts.map(publishClaimed))
+  const failed = results.some(r => !r.published && !r.paused && !r.deferred_min)
+  return NextResponse.json({ published: results.some(r => r.published), results }, { status: failed ? 502 : 200 })
 }

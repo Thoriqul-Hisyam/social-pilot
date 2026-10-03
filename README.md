@@ -1,17 +1,19 @@
 # SocialPilot
 
-Multi-account publishing untuk Threads (Facebook Page menyusul). Next.js + SQLite, tanpa dependency runtime tambahan.
+Publishing multi-akun dan multi-platform: Threads, Instagram, dan Facebook Page. Next.js + SQLite; satu dependency runtime tambahan, `sharp`, untuk menyesuaikan gambar ke aturan Instagram dan Facebook.
 
 ## Fitur
 
 - Dashboard terproteksi password
-- OAuth Threads, token 60 hari, tersimpan terenkripsi AES-256-GCM, diperpanjang otomatis sekitar seminggu sekali
-- Composer: teks + gambar atau video, >500 karakter otomatis jadi balasan berantai
-- Antrean dengan jeda acak 5–30 menit setelah slot antrean terakhir, dedup per `source_url` untuk berita
+- Banyak akun di banyak platform: Threads, Instagram (akun Business/Creator), dan Facebook Page. Tiap akun dihubungkan lewat OAuth platformnya, tokennya tersimpan terenkripsi AES-256-GCM
+- Token Threads dan Instagram (60 hari) diperpanjang otomatis sekitar seminggu sekali; token Page Facebook tidak kedaluwarsa
+- Tiap akun memilih jenis post yang diterima otomatis (Berita, Affiliate, keduanya, atau tidak sama sekali). Post dari Hermes tanpa `accountId` masuk ke semua akun yang cocok
+- Composer: teks + gambar atau video. Di Threads, >500 karakter jadi balasan berantai; di platform lain teks jadi satu post dan dipotong sesuai batasnya (Instagram 2.200 karakter), baris `Sumber:` tetap dipertahankan
+- Antrean per akun: tiap akun punya ritme sendiri dengan jeda acak 5–30 menit setelah slot antreannya yang terakhir, dedup per `source_url` untuk berita per akun
 - Jenis post `news` (berita) dan `affiliate`; dashboard bisa difilter per jenis, tiap daftar berhalaman 10 post
-- Worker tick: 1 post per panggilan, retry 3x dengan jeda 10 lalu 20 menit, klaim atomic
-- Insight Threads per post (views, likes, replies, reposts, quotes, shares), dibandingkan per jenis di dashboard dan lewat `GET /api/insights`
-- Antrean akun dijeda otomatis kalau Threads menolak tokennya, sampai akun dihubungkan ulang
+- Worker tick: maksimal 1 post per akun per panggilan, akun-akun berjalan bersamaan; retry 3x dengan jeda 10 lalu 20 menit, klaim atomic
+- Insight per post dari tiap platform (views, likes, balasan/komentar, reposts, quotes, shares), dibandingkan per jenis dan bisa difilter per platform di dashboard dan lewat `GET /api/insights`
+- Antrean akun dijeda otomatis kalau platform menolak tokennya, sampai akun dihubungkan ulang; akun lain tetap jalan. Batas harian Instagram dan rate limit menunda post 1 jam tanpa menghabiskan percobaannya
 - REST API untuk otomasi (scraper, cron, n8n)
 
 ## Deploy
@@ -49,6 +51,30 @@ Tanpa `threads_manage_replies`, post >500 karakter gagal di bagian kedua. Tanpa 
 
 Threads menolak HTTP dan IP LAN. Harus domain HTTPS.
 
+### 2b. Platform lain (opsional)
+
+Isi hanya platform yang dipakai. Platform yang env-nya belum lengkap tampil abu-abu di menu **Hubungkan akun** beserta env yang kurang. Semua callback memakai `PUBLIC_APP_URL` (atau origin `THREADS_REDIRECT_URI`), kecuali di-override dengan `<PLATFORM>_REDIRECT_URI`.
+
+**Instagram** (Instagram API with Instagram Login; akun harus Business atau Creator, tanpa perlu Page Facebook)
+
+1. developers.facebook.com → app → **Add use case** → *Manage messaging & content on Instagram*. Use case tidak bisa dihapus lagi; kalau tidak bisa digabung dengan app Threads, buat app Meta terpisah.
+2. **Instagram → API setup with Instagram login → Set up Instagram business login → Business login settings**: OAuth redirect URI `https://domain.com/api/auth/instagram/callback` (ganti `domain.com` dengan domain dashboard). Lewati langkah *Configure webhooks*: SocialPilot tidak memakai webhook. Form webhook memanggil URL-nya untuk verifikasi, jadi URL callback OAuth yang diisi di sana selalu gagal dengan "URL callback atau token verifikasi tidak dapat divalidasi".
+3. Salin *Instagram app ID* dan *Instagram app secret* (beda dari Meta app ID) ke `INSTAGRAM_APP_ID` dan `INSTAGRAM_APP_SECRET`.
+4. Selama app belum lolos App Review, tambahkan akun sebagai **Instagram Tester** (App roles), lalu terima undangannya di instagram.com → Settings → Apps and websites → Tester invites.
+5. Isi URL deauthorize dan data deletion dengan URL Threads di atas; endpoint-nya sama.
+
+Permission: `instagram_business_basic`, `instagram_business_content_publish`, `instagram_business_manage_insights`. Gambar disalin ke R2 sebagai JPEG (Instagram menolak PNG/WebP), dilebarkan dengan bidang putih ke rasio 4:5–1.91:1 (tidak di-crop), lebar 320–1440 px. Video terbit sebagai Reels. Instagram membatasi 50–100 post API per 24 jam per akun (dokumentasi Meta tidak konsisten); begitu tercapai, post ditunda 1 jam dan dicoba lagi. Post Instagram tidak bisa dihapus lewat API ini.
+
+**Facebook Page**
+
+1. developers.facebook.com → **My Apps** → app Threads → menu kiri **Use cases** (Kasus penggunaan) → **Add use case** → *Manage everything on your Page* (Kelola semua hal di Halaman Anda). Menurut dokumentasi Meta, use case ini bisa digabung dengan Threads; kalau opsinya abu-abu, buat app baru dengan use case ini.
+2. Menu kiri **Dashboard** → use case Page → **Customize** (Sesuaikan) → **Permissions and features**: **Add** `pages_manage_posts`, `pages_read_engagement`, `read_insights` (`pages_show_list` sudah ada).
+3. Menu kiri **Facebook Login for Business → Settings**: Valid OAuth Redirect URIs `https://domain.com/api/auth/facebook/callback` (ganti `domain.com` dengan domain dashboard).
+4. **Facebook Login for Business → Configurations → Create configuration**: token *User access token*, masa berlaku *Never* kalau ada, aset Page yang mau dipakai, izin dari langkah 2. Salin *Configuration ID* ke `FACEBOOK_CONFIG_ID`; login lalu memakai `config_id`, bukan `scope`, sesuai anjuran Meta.
+5. Menu kiri **App settings → Basic** (Pengaturan aplikasi → Dasar): *App ID* ke `META_FACEBOOK_APP_ID`, *App secret* ke `META_FACEBOOK_APP_SECRET`. Nilainya beda dari `META_THREADS_APP_ID` walaupun app-nya sama.
+
+Permission: `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `read_insights`. Saat menyetujui, pilih Page yang mau dikelola: satu kali connect menambahkan semua Page yang bisa kamu posting, masing-masing sebagai akun sendiri. Token Page tidak kedaluwarsa, jadi tidak ada perpanjangan; connect ulang kalau password Facebook diganti atau izin dicabut. Teks dikirim utuh, gambar disalin ke R2 sebagai JPEG (batas Facebook 4 MB).
+
 ### 3. Siapkan Cloudflare R2
 
 Threads mengunduh gambar sendiri dari `imageUrl`. Banyak CDN berita (misalnya `image.cnbcfm.com`) menolak pengunduh Meta dengan 403, dan Threads melaporkannya hanya sebagai `[threads 1]: An unknown error has occurred`. Karena itu app mengunduh gambar lebih dulu dengan user-agent browser, lalu mengunggahnya ke R2. URL R2 itulah yang diberikan ke Threads.
@@ -56,10 +82,10 @@ Threads mengunduh gambar sendiri dari `imageUrl`. Banyak CDN berita (misalnya `i
 1. **R2 → Create bucket**, misalnya `socialpilot-media`.
 2. **Bucket → Settings → Custom Domains**: hubungkan subdomain, misalnya `media.domain.com`. URL `r2.dev` juga bisa, tapi rate-nya dibatasi dan hanya untuk uji.
 3. **R2 → Manage API tokens → Create API token**: izin *Object Read & Write*, dibatasi ke bucket ini. Salin Access Key ID dan Secret Access Key ke `R2_ACCESS_KEY_ID` dan `R2_SECRET_ACCESS_KEY`. Account ID ada di halaman R2.
-4. **Bucket → Settings → Object lifecycle rules**: hapus objek berawalan `threads/` setelah 7 hari. Threads hanya mengambil gambar saat post dibuat.
+4. **Bucket → Settings → Object lifecycle rules**: hapus objek berawalan `threads/`, `instagram/`, dan `facebook/` setelah 7 hari (atau satu aturan tanpa prefix kalau bucket ini khusus SocialPilot). Platform hanya mengambil gambar saat post dibuat.
 5. Jangan pasang Bot Fight Mode atau WAF challenge di domain bucket. Kalau terpasang, pengunduh Meta bisa terblokir lagi.
 
-Tanpa lima env `R2_*`, post bergambar langsung gagal dengan `R2 not configured` tanpa dicoba ulang otomatis. Env hanya dibaca saat proses start, jadi setelah mengisinya restart app (`systemctl restart socialpilot`, atau `docker compose up -d` karena `docker compose restart` tidak membaca ulang `env_file`), lalu klik **Proses ulang** di dashboard. Hanya JPEG/PNG maksimal 8 MB yang diterima. WebP, AVIF, dan GIF ditolak dengan pesan yang menyebut formatnya. CDN yang menjawab file tidak ada dengan HTTP 200 dan body kosong atau HTML (misalnya `cdn.antaranews.com`) menghasilkan `image download failed … Does the file exist?` beserta URL-nya, dan post itu dicoba ulang otomatis. Video tidak disalin; `videoUrl` tetap diberikan langsung ke Threads.
+Tanpa lima env `R2_*`, post bergambar Threads, Instagram, dan Facebook langsung gagal dengan `R2 not configured` tanpa dicoba ulang otomatis. Env hanya dibaca saat proses start, jadi setelah mengisinya restart app (`systemctl restart socialpilot`, atau `docker compose up -d` karena `docker compose restart` tidak membaca ulang `env_file`), lalu klik **Proses ulang** di dashboard. Untuk Threads hanya JPEG/PNG maksimal 8 MB yang diterima; WebP, AVIF, dan GIF ditolak dengan pesan yang menyebut formatnya. Untuk Instagram dan Facebook format itu dikonversi ke JPEG. CDN yang menjawab file tidak ada dengan HTTP 200 dan body kosong atau HTML (misalnya `cdn.antaranews.com`) menghasilkan `image download failed … Does the file exist?` beserta URL-nya, dan post itu dicoba ulang otomatis. Video tidak disalin: `videoUrl` diberikan langsung ke Threads, Instagram, dan Facebook.
 
 ### 4. Jalankan
 
@@ -91,9 +117,11 @@ Reverse proxy: lihat `deploy/nginx.conf`. Wajib meneruskan `X-Forwarded-For` —
 
 ### 5. Hubungkan akun
 
-Buka `https://domain.com`, login, klik **Tambah akun Threads**.
+Buka `https://domain.com`, login, klik **Hubungkan akun** lalu pilih platformnya (atau tombol platform di kartu Akun). Untuk menambah akun kedua di platform yang sama, keluar dulu dari akun pertama di browser (threads.net, instagram.com), lalu hubungkan lagi.
 
-Buka dashboard lewat domain yang sama dengan `THREADS_REDIRECT_URI`, bukan `localhost` atau IP. Callback hanya menerima akun kalau cookie login dan cookie `state` OAuth ikut kembali, dan cookie itu terikat ke domain. Kalau penukaran ke token 60 hari gagal, akun tidak disimpan.
+Di kartu Akun, tombol **Berita** dan **Affiliate** di tiap akun menentukan jenis post dari Hermes yang masuk otomatis. Akun lama menerima keduanya; akun baru juga, sampai diubah.
+
+Buka dashboard lewat domain yang sama dengan `PUBLIC_APP_URL` / `THREADS_REDIRECT_URI`, bukan `localhost` atau IP. Callback hanya menerima akun kalau cookie login dan cookie `state` OAuth ikut kembali, dan cookie itu terikat ke domain. Kalau penukaran ke token 60 hari gagal, akun tidak disimpan.
 
 ## API
 
@@ -108,28 +136,30 @@ curl -X POST https://domain.com/api/posts \
   -d '{"items":[{"caption":"...","imageUrl":"https://...","sourceUrl":"https://...","kind":"news"}]}'
 ```
 
-`kind` wajib di setiap item: `news` (berita, sertakan `sourceUrl` artikelnya) atau `affiliate`, persis huruf kecil. Item tanpa `kind` atau dengan nilai lain menolak seluruh batch (HTTP 400, `items_with_invalid_kind` menyebut nomor itemnya), dan tidak ada yang masuk antrean. `sourceUrl` berita yang sama tidak akan diantrekan dua kali; affiliate boleh berulang. Tiap item butuh tepat satu `imageUrl` atau `videoUrl` (HTTPS publik). `scheduledAt` opsional (ISO, boleh dengan offset seperti `+07:00`; tanpa zona dianggap UTC). Satu item yang tidak valid menolak seluruh batch.
+Item tanpa `accountId` masuk ke **semua akun aktif yang menerima jenisnya** (tombol Berita/Affiliate di kartu Akun), masing-masing di antrean akunnya sendiri. Item yang tidak cocok dengan akun mana pun dilewati dan nomornya ada di `no_target`. Item dengan `accountId` hanya masuk ke akun itu. `captions` opsional mengganti caption untuk platform tertentu, misalnya `"captions":{"instagram":"versi pendek…","facebook":"…"}`; platform tanpa versi sendiri memakai `caption` dan dipotong otomatis.
 
-Publish langsung:
+`kind` wajib di setiap item: `news` (berita, sertakan `sourceUrl` artikelnya) atau `affiliate`, persis huruf kecil. Item tanpa `kind` atau dengan nilai lain menolak seluruh batch (HTTP 400, `items_with_invalid_kind` menyebut nomor itemnya), dan tidak ada yang masuk antrean. `sourceUrl` berita yang sama tidak akan diantrekan dua kali ke akun yang sama (`skipped_duplicates`); affiliate boleh berulang. Tiap item butuh tepat satu `imageUrl` atau `videoUrl` (HTTPS publik). `scheduledAt` opsional (ISO, boleh dengan offset seperti `+07:00`; tanpa zona dianggap UTC). Satu item yang tidak valid menolak seluruh batch.
+
+Publish langsung ke satu akun, platform apa pun:
 
 ```bash
-curl -X POST https://domain.com/api/publish/threads \
+curl -X POST https://domain.com/api/publish \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"text":"...","imageUrl":"https://...","kind":"news"}'
+  -d '{"text":"...","imageUrl":"https://...","kind":"news","accountId":3}'
 ```
 
-`kind` juga wajib di sini, dengan nilai yang sama.
+`kind` juga wajib di sini, dengan nilai yang sama. `accountId` boleh dihilangkan kalau hanya ada satu akun aktif. `/api/publish/threads` tetap jalan seperti dulu, khusus akun Threads.
 
 Insight performa (untuk dashboard dan crew):
 
 ```bash
-curl "https://domain.com/api/insights?days=7&kind=news" -H "Authorization: Bearer $API_KEY"
+curl "https://domain.com/api/insights?days=7&kind=news&platform=instagram" -H "Authorization: Bearer $API_KEY"
 ```
 
-`days` 1–90 (default 7), `kind` opsional. Hasilnya per jenis: `posts`, `covered` (post yang sudah terbaca), `errors` (post yang pembacaan terakhirnya gagal), `gone` (post yang sudah dihapus di Threads; tidak dibaca lagi dan tidak ikut di angka lain), total `views`/`likes`/`replies`/`reposts`/`quotes`/`shares`, `avg_views`, `avg_likes`, dan `engagement_rate` = (likes + replies + reposts + quotes + shares) / views. Ditambah `top` dan `bottom` (5 post, caption 120 karakter; `bottom` melewati post yang belum berumur sehari), serta `top_by_kind` dan `bottom_by_kind` per jenis. Angka diambil worker tick, 20 post per tick: post yang belum pernah terbaca lebih dulu (terbaru dulu, termasuk riwayat lama), lalu dibaca ulang tiap 3 jam di hari pertamanya dan tiap 12 jam sampai berumur seminggu. Pembacaan yang gagal dicoba lagi tiap jam sampai post berumur 30 hari. Kalau server tidak tersambung ke Threads, batch berhenti tanpa menandai post gagal dan dicoba lagi di tick berikutnya. Setelah akun dihubungkan ulang, riwayat lama butuh beberapa jam sampai terbaca semua; selama itu angka 30 hari masih didominasi post terbaru. Untuk chain, yang dibaca post akarnya; balasan tidak dijumlahkan Threads.
+`days` 1–90 (default 7), `kind` dan `platform` (`threads`, `instagram`, `facebook`) opsional. Tanpa `platform`, angka semua platform dijumlahkan; views tiap platform dihitung berbeda, jadi bandingkan per platform. Hasilnya per jenis: `posts`, `covered` (post yang sudah terbaca), `errors` (post yang pembacaan terakhirnya gagal), `gone` (post yang sudah dihapus di Threads; tidak dibaca lagi dan tidak ikut di angka lain), total `views`/`likes`/`replies`/`reposts`/`quotes`/`shares`, `avg_views`, `avg_likes`, dan `engagement_rate` = (likes + replies + reposts + quotes + shares) / views. Ditambah `top` dan `bottom` (5 post, caption 120 karakter; `bottom` melewati post yang belum berumur sehari), serta `top_by_kind` dan `bottom_by_kind` per jenis. Angka diambil worker tick, 20 post per tick: post yang belum pernah terbaca lebih dulu (terbaru dulu, termasuk riwayat lama), lalu dibaca ulang tiap 3 jam di hari pertamanya dan tiap 12 jam sampai berumur seminggu. Pembacaan yang gagal dicoba lagi tiap jam sampai post berumur 30 hari. Kalau server tidak tersambung ke Threads, batch berhenti tanpa menandai post gagal dan dicoba lagi di tick berikutnya. Setelah akun dihubungkan ulang, riwayat lama butuh beberapa jam sampai terbaca semua; selama itu angka 30 hari masih didominasi post terbaru. Untuk chain, yang dibaca post akarnya; balasan tidak dijumlahkan Threads.
 
-Tick manual:
+Tick manual (hasilnya `results`, satu entri per post yang dikirim):
 
 ```bash
 curl -X POST https://domain.com/api/worker/tick -H "Authorization: Bearer $API_KEY"
@@ -144,7 +174,7 @@ curl https://domain.com/api/health
 ## Test
 
 ```bash
-npm test            # 130 assertions: crypto, DB, migrasi kind, refresh token, jeda token, insight, post dihapus di Threads, dedup, paginasi, jeda retry, atomic claim, retry, queue tail, text split, preview, R2 signing, image sniffing
+npm test            # ~180 assertions: crypto, DB, migrasi, routing per akun, klaim per akun, refresh token, jeda token, insight, dedup, paginasi, retry, queue tail, pemotongan teks per platform, konversi gambar, adapter Instagram/Facebook (fetch di-stub), R2 signing
 npm run typecheck   # tsc --noEmit
 npm run build       # production build
 ```
@@ -166,10 +196,10 @@ Catatan: `Dockerfile` dan `docker-compose.yml` belum pernah dieksekusi di mesin 
 - `imageUrl` harus URL publik HTTPS. Path lokal ditolak Threads. Gambar disalin ke R2 sebelum dikirim (lihat langkah 3).
 - Error kode 1/2 dari Threads saat membuat container dicoba ulang dua kali (jeda 5 dan 15 detik). Error Threads menyertakan `fbtrace_id` untuk dilaporkan ke Meta.
 - Batas teks Threads 500 karakter per post; sisanya jadi balasan.
-- Kalau Threads menolak token (kode 190, misalnya izin dicabut atau password akun diganti), antrean akun itu dijeda: post tidak dihabiskan percobaannya, dashboard menampilkan banner merah, dan antrean jalan lagi begitu akun dihubungkan ulang.
-- Token kedaluwarsa 60 hari. Worker tick memperpanjangnya otomatis begitu sisa masa berlakunya di bawah 53 hari. Kalau gagal, feed crew menampilkan `Token @… gagal diperpanjang` dan dicoba lagi 12 jam kemudian. Dashboard tetap menampilkan tanggal kedaluwarsa; connect ulang kalau perpanjangan terus gagal.
+- Kalau platform menolak token (Meta kode 190, misalnya izin dicabut atau password akun diganti), antrean akun itu dijeda: post tidak dihabiskan percobaannya, dashboard menampilkan banner merah, dan antrean jalan lagi begitu akun dihubungkan ulang. Akun lain tidak ikut berhenti.
+- Token Threads dan Instagram kedaluwarsa 60 hari. Worker tick memperpanjangnya otomatis begitu sisa masa berlakunya di bawah 53 hari. Kalau gagal, feed crew menampilkan `Token @… gagal diperpanjang` dan dicoba lagi 12 jam kemudian. Dashboard tetap menampilkan tanggal kedaluwarsa; connect ulang kalau perpanjangan terus gagal.
 - Backup: cukup salin file di volume `/app/data`.
 
-## Belum ada
+## Belum diuji ke API sungguhan
 
-- Facebook Page publishing (skema DB sudah siap)
+Adapter Instagram dan Facebook ditulis dari dokumentasi resmi (Oktober 2026) dan diuji dengan fetch tiruan; belum pernah terbit ke akun sungguhan. Saat menghubungkan akun pertama tiap platform, terbitkan satu post lewat **Terbitkan** dulu dan cek feed crew. Yang paling mungkin perlu disesuaikan: insight video Facebook (`video_insights` `total_video_views`).
