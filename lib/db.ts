@@ -13,6 +13,17 @@ export const POST_KINDS: readonly PostKind[] = ['news', 'affiliate']
 /** Every post must say which it is; nothing is classified by guesswork. */
 export const isPostKind = (v: unknown): v is PostKind => v === 'news' || v === 'affiliate'
 
+/**
+ * How a group shares the items that name no account, of its kind (news, affiliate or all).
+ * same: its members post an item together or not at all. split: at most one of them posts it,
+ * so they post different items. An account may sit in many groups; see lib/routing.ts.
+ */
+export type GroupMode = 'same' | 'split'
+export const isGroupMode = (v: unknown): v is GroupMode => v === 'same' || v === 'split'
+export type GroupKind = PostKind | 'all'
+export const isGroupKind = (v: unknown): v is GroupKind => v === 'all' || isPostKind(v)
+export type AccountGroup = { id: number; name: string; mode: GroupMode; kind: GroupKind; account_ids: number[] }
+
 export type Account = {
   id: number
   platform: Platform
@@ -123,6 +134,22 @@ export function getDb(): DatabaseSync {
   // auto_* route posts that name no account. Existing accounts keep receiving everything.
   try { db.exec('ALTER TABLE accounts ADD COLUMN auto_news INTEGER NOT NULL DEFAULT 1') } catch { /* already migrated */ }
   try { db.exec('ALTER TABLE accounts ADD COLUMN auto_affiliate INTEGER NOT NULL DEFAULT 1') } catch { /* already migrated */ }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS account_groups (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      name       TEXT NOT NULL,
+      mode       TEXT NOT NULL DEFAULT 'same',
+      kind       TEXT NOT NULL DEFAULT 'all',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS group_members (
+      group_id   INTEGER NOT NULL REFERENCES account_groups(id) ON DELETE CASCADE,
+      account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      PRIMARY KEY (group_id, account_id)
+    );
+  `)
+  // A database from before group kinds: its groups apply to every kind.
+  try { db.exec("ALTER TABLE account_groups ADD COLUMN kind TEXT NOT NULL DEFAULT 'all'") } catch { /* already migrated */ }
   // Rows from before the column: news always carried its article URL, affiliate never did.
   // Column and backfill land together, so a failed upgrade never leaves every row marked news.
   const cols = db.prepare('PRAGMA table_info(posts)').all() as { name: string }[]
@@ -203,6 +230,61 @@ export function setAccountRouting(id: number, r: { auto_news?: boolean; auto_aff
 /** Enabled accounts that take posts of this kind when the post names no account. */
 export function routeTargets(kind: PostKind): Account[] {
   return listAccounts().filter(a => a.enabled && (kind === 'news' ? a.auto_news : a.auto_affiliate))
+}
+
+// --- account groups -----------------------------------------------------------
+
+export function listGroups(): AccountGroup[] {
+  const rows = getDb().prepare(`
+    SELECT g.id, g.name, g.mode, g.kind,
+      (SELECT json_group_array(account_id) FROM (SELECT account_id FROM group_members WHERE group_id = g.id ORDER BY account_id)) account_ids
+    FROM account_groups g ORDER BY g.id
+  `).all() as (Omit<AccountGroup, 'account_ids'> & { account_ids: string })[]
+  return rows.map(r => ({ ...r, account_ids: JSON.parse(r.account_ids) as number[] }))
+}
+
+/** The groups that shape where items of this kind go. */
+export function groupsFor(kind: PostKind): AccountGroup[] {
+  return listGroups().filter(g => g.kind === 'all' || g.kind === kind)
+}
+
+export function createGroup(g: { name: string; mode?: GroupMode; kind?: GroupKind; account_ids?: number[] }): number {
+  const { id } = getDb().prepare('INSERT INTO account_groups (name, mode, kind) VALUES (?, ?, ?) RETURNING id')
+    .get(g.name, g.mode ?? 'same', g.kind ?? 'all') as { id: number }
+  if (g.account_ids) setGroupMembers(id, g.account_ids)
+  return id
+}
+
+/** Unset fields stay; account_ids replaces the members. */
+export function updateGroup(id: number, g: { name?: string; mode?: GroupMode; kind?: GroupKind; account_ids?: number[] }) {
+  getDb().prepare('UPDATE account_groups SET name = COALESCE(?, name), mode = COALESCE(?, mode), kind = COALESCE(?, kind) WHERE id = ?')
+    .run(g.name ?? null, g.mode ?? null, g.kind ?? null, id)
+  if (g.account_ids) setGroupMembers(id, g.account_ids)
+}
+
+/** Ids that are not accounts are left out. */
+export function setGroupMembers(id: number, accountIds: number[]) {
+  getDb().exec('BEGIN')
+  try {
+    getDb().prepare('DELETE FROM group_members WHERE group_id = ?').run(id)
+    getDb().prepare(`
+      INSERT INTO group_members (group_id, account_id)
+      SELECT ?, a.id FROM accounts a WHERE a.id IN (SELECT value FROM json_each(?))
+    `).run(id, JSON.stringify(accountIds))
+    getDb().exec('COMMIT')
+  } catch (e) { getDb().exec('ROLLBACK'); throw e }
+}
+
+/** Its accounts stay. */
+export function deleteGroup(id: number) {
+  getDb().prepare('DELETE FROM account_groups WHERE id = ?').run(id)
+}
+
+/** Whether any of these accounts already has this news article, queued or published: a split group posts it once. */
+export function newsQueuedIn(accountIds: number[], sourceUrl: string): boolean {
+  return !!getDb().prepare(`
+    SELECT 1 FROM posts WHERE kind = 'news' AND source_url = ? AND account_id IN (SELECT value FROM json_each(?)) LIMIT 1
+  `).get(sourceUrl, JSON.stringify(accountIds))
 }
 
 /** A token is refreshed once it has under this many days left: about weekly, as a fresh one has 60. */
@@ -382,18 +464,18 @@ const VIEWS: Record<PostView, { where: string; order: string }> = {
 }
 
 /** One page of a dashboard list, of one kind or (kind null) all, plus the total for paging. */
-export function pagePosts(view: PostView, o: { kind?: PostKind | null; limit?: number; offset?: number } = {}) {
+export function pagePosts(view: PostView, o: { kind?: PostKind | null; accountId?: number | null; limit?: number; offset?: number } = {}) {
   if (view === 'queue') recoverStalePublishing()
-  const kind = o.kind ?? null
+  const kind = o.kind ?? null, account = o.accountId ?? null
   const from = `
     FROM posts p JOIN accounts a ON a.id = p.account_id
     LEFT JOIN post_metrics m ON m.post_id = p.id
-    WHERE ${VIEWS[view].where} AND (? IS NULL OR p.kind = ?)`
-  const { n } = getDb().prepare(`SELECT COUNT(*) n ${from}`).get(kind, kind) as { n: number }
+    WHERE ${VIEWS[view].where} AND (? IS NULL OR p.kind = ?) AND (? IS NULL OR p.account_id = ?)`
+  const { n } = getDb().prepare(`SELECT COUNT(*) n ${from}`).get(kind, kind, account, account) as { n: number }
   const posts = getDb().prepare(`
     SELECT p.*, a.username, a.platform, m.views, m.likes, m.replies, m.reposts, m.quotes, m.shares, m.gone_at ${from}
     ORDER BY ${VIEWS[view].order} LIMIT ? OFFSET ?
-  `).all(kind, kind, o.limit ?? 50, o.offset ?? 0) as ListedPost[]
+  `).all(kind, kind, account, account, o.limit ?? 50, o.offset ?? 0) as ListedPost[]
   return { posts, total: n }
 }
 
@@ -477,11 +559,11 @@ export function listPosts(limit = 50): ListedPost[] {
   return pagePosts('all', { limit }).posts
 }
 
-/** Post counts of one kind, or (kind null) all. The account count ignores kind. */
-export function stats(kind: PostKind | null = null) {
+/** Post counts of one kind, or (kind null) all, of one account or all. The account count ignores both. */
+export function stats(kind: PostKind | null = null, accountId: number | null = null) {
   const rows = getDb().prepare(
-    `SELECT status, COUNT(*) n FROM posts WHERE ? IS NULL OR kind = ? GROUP BY status`
-  ).all(kind, kind) as { status: string; n: number }[]
+    `SELECT status, COUNT(*) n FROM posts WHERE (? IS NULL OR kind = ?) AND (? IS NULL OR account_id = ?) GROUP BY status`
+  ).all(kind, kind, accountId, accountId) as { status: string; n: number }[]
   const by = Object.fromEntries(rows.map(r => [r.status, r.n]))
   const accounts = getDb().prepare(
     'SELECT COUNT(*) n FROM accounts WHERE enabled = 1'
@@ -560,15 +642,15 @@ export type RankedPost = Metrics & { id: number; kind: PostKind; caption: string
  * covered counts the posts with a reading; averages divide by it, not by posts.
  * errors counts posts whose latest reading failed.
  * gone counts posts deleted on their platform; every other number leaves them out.
- * platform narrows it to one platform's accounts; views are not comparable across platforms.
+ * platform narrows it to one platform's accounts, accountId to one account; views are not comparable across platforms.
  * engagement_rate = (likes + replies + reposts + quotes + shares) / views.
  * top/bottom rank across the kinds asked for; top_by_kind/bottom_by_kind rank each.
  * bottom skips posts under a day old, which have not had their audience yet.
  */
-export function insightsSummary(days: number, kind: PostKind | null = null, platform: Platform | null = null) {
+export function insightsSummary(days: number, kind: PostKind | null = null, platform: Platform | null = null, accountId: number | null = null) {
   const since = `-${days} days`
   const where = `p.status = 'published' AND p.published_at > datetime('now', ?) AND (? IS NULL OR p.kind = ?)
-    AND (? IS NULL OR p.account_id IN (SELECT id FROM accounts WHERE platform = ?))`
+    AND (? IS NULL OR p.account_id IN (SELECT id FROM accounts WHERE platform = ?)) AND (? IS NULL OR p.account_id = ?)`
   // m holds readings of posts still up, g marks the deleted ones.
   const rows = getDb().prepare(`
     SELECT p.kind, COUNT(*) - COUNT(g.post_id) posts, COUNT(g.post_id) gone, COUNT(m.views) covered, COUNT(m.error) errors,
@@ -578,7 +660,7 @@ export function insightsSummary(days: number, kind: PostKind | null = null, plat
     LEFT JOIN post_metrics m ON m.post_id = p.id AND m.gone_at IS NULL
     LEFT JOIN post_metrics g ON g.post_id = p.id AND g.gone_at IS NOT NULL
     WHERE ${where} GROUP BY p.kind
-  `).all(since, kind, kind, platform, platform) as (Metrics & { kind: PostKind; posts: number; covered: number; errors: number; gone: number })[]
+  `).all(since, kind, kind, platform, platform, accountId, accountId) as (Metrics & { kind: PostKind; posts: number; covered: number; errors: number; gone: number })[]
   const by_kind: Partial<Record<PostKind, KindSummary>> = {}
   for (const { kind: k, ...r } of rows) {
     const engaged = r.likes + r.replies + r.reposts + r.quotes + r.shares
@@ -596,12 +678,12 @@ export function insightsSummary(days: number, kind: PostKind | null = null, plat
     WHERE ${where} AND m.views IS NOT NULL AND m.gone_at IS NULL
       ${order === 'ASC' ? "AND p.published_at < datetime('now', '-1 day')" : ''}
     ORDER BY m.views ${order}, p.id DESC LIMIT 5
-  `).all(since, k, k, platform, platform) as RankedPost[]
+  `).all(since, k, k, platform, platform, accountId, accountId) as RankedPost[]
   const perKind = (order: 'ASC' | 'DESC') => Object.fromEntries(
     POST_KINDS.filter(k => !kind || k === kind).map(k => [k, ranked(k, order)]),
   ) as Partial<Record<PostKind, RankedPost[]>>
   return {
-    days, kind, platform, by_kind,
+    days, kind, platform, account_id: accountId, by_kind,
     top: ranked(kind, 'DESC'),
     bottom: ranked(kind, 'ASC'),
     top_by_kind: perKind('DESC'),

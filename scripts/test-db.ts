@@ -351,5 +351,54 @@ db.getDb().prepare('DELETE FROM post_metrics WHERE post_id = ?').run(fp)
 check('a facebook post is read like any other', db.postsNeedingInsights(500).find(p => p.id === fp)?.platform === 'facebook')
 check('an account waiting out a limit is skipped', !db.postsNeedingInsights(500, [acc]).some(p => p.account_id === acc))
 
+// --- groups: an account may sit in many; each group has a kind and a mode ---
+const { pickAccounts } = await import('../lib/routing')
+const grpA = db.createGroup({ name: 'A', mode: 'split', kind: 'affiliate', account_ids: [acc, fb] })
+const grpB = db.createGroup({ name: 'B', kind: 'news', account_ids: [acc, ig, 999999] })
+check('groups list their kind, mode and members', db.listGroups().map(g => `${g.name}:${g.kind}:${g.mode}:${g.account_ids.join('+')}`).join()
+  === `A:affiliate:split:${[acc, fb].sort((a, b) => a - b).join('+')},B:news:same:${[acc, ig].sort((a, b) => a - b).join('+')}`)
+check('an account can sit in several groups', db.listGroups().filter(g => g.account_ids.includes(acc)).length === 2)
+check('groupsFor keeps the groups of that kind and of every kind', db.groupsFor('news').map(g => g.name).join() === 'B' && db.groupsFor('affiliate').map(g => g.name).join() === 'A')
+db.updateGroup(grpB, { kind: 'all', mode: 'split', name: 'B2', account_ids: [ig, fb2] })
+const b2 = db.listGroups().find(g => g.id === grpB)!
+check('a group changes kind, mode, name and members', b2.kind === 'all' && b2.mode === 'split' && b2.name === 'B2' && b2.account_ids.join() === [ig, fb2].sort((a, b) => a - b).join())
+check('a group of every kind shapes both kinds', db.groupsFor('affiliate').some(g => g.id === grpB) && db.groupsFor('news').some(g => g.id === grpB))
+db.deleteGroup(grpA)
+check('deleting a group drops its memberships and keeps the accounts',
+  !db.listGroups().some(g => g.id === grpA) && db.listAccounts().some(a => a.id === fb) &&
+  (db.getDb().prepare('SELECT COUNT(*) n FROM group_members WHERE group_id = ?').get(grpA) as { n: number }).n === 0)
+db.deleteGroup(grpB)
+db.queuePost({ account_id: fb, caption: 'shop news', source_url: 'https://news/shop-1', kind: 'news', scheduled_at: future })
+check('newsQueuedIn sees an article an account already has', db.newsQueuedIn([fb, fb2], 'https://news/shop-1') && !db.newsQueuedIn([fb2], 'https://news/shop-1'))
+
+// The user's setup: Threads 1, IG 2, FB Usaha Jaya 3, FB Media Internet 4.
+// A: Threads + Usaha Jaya, affiliate, Beda. B: Threads + IG, news, Sama. C: Threads + Media Internet, news, Beda.
+const A = { mode: 'split' as const, account_ids: [1, 3] }, B = { mode: 'same' as const, account_ids: [1, 2] }, C = { mode: 'split' as const, account_ids: [1, 4] }
+const run = (candidates: number[], groups: { mode: 'same' | 'split'; account_ids: number[] }[], items: number) => {
+  const tails = new Map(candidates.map(id => [id, 0]))
+  const out: string[] = []
+  for (let n = 0; n < items; n++) {
+    const picked = pickAccounts(candidates, groups, id => tails.get(id)!)
+    out.push(picked.join('+'))
+    for (const id of picked) tails.set(id, tails.get(id)! + 20)
+  }
+  return out.join(' ')
+}
+check('news alternates between Threads with IG, and Media Internet', run([1, 2, 4], [B, C], 4) === '1+2 4 1+2 4')
+check('affiliate alternates between Threads and Usaha Jaya', run([1, 3], [A], 4) === '1 3 1 3')
+check('the account with the shorter queue goes first', pickAccounts([1, 2, 4], [B, C], id => id === 2 ? 50 : 0).join() === '4')
+check('a split group never posts news one member already has', pickAccounts([1, 2, 4], [B, C], () => 0, id => id === 4).join() === '4')
+check('an account in no group always gets it', pickAccounts([1, 2, 4, 5], [B, C], () => 0).join() === '1,2,5')
+check('a group member that does not take the kind is left out', pickAccounts([2, 4], [B, C], () => 0).join() === '2,4')
+check('without groups every candidate gets it', pickAccounts([1, 2, 3], [], () => 0).join() === '1,2,3')
+check('same groups chain together', pickAccounts([1, 2, 3, 4], [{ mode: 'same', account_ids: [1, 2] }, { mode: 'same', account_ids: [2, 3] }, { mode: 'split', account_ids: [3, 4] }], id => id === 4 ? 99 : 0).join() === '1,2,3')
+
+// --- per-account views ---
+const onlyFb2 = db.pagePosts('history', { accountId: fb2, limit: 100 })
+check('lists narrow to one account', onlyFb2.total === 1 && onlyFb2.posts.every(p => p.account_id === fb2))
+check('stats narrow to one account', db.stats(null, fb2).published === 1 && db.stats(null, null).published > 1)
+db.saveMetrics(fp, { views: 900, likes: 9, replies: 0, reposts: 0, quotes: 0, shares: 0 })
+check('performa narrows to one account', db.insightsSummary(7, null, null, fb2).by_kind.news?.views === 900 && db.insightsSummary(7, null, null, acc).by_kind.news?.views !== 900)
+
 cleanup()
-console.log(`OK — ${n} assertions passed (crypto, kind migration, accounts, token refresh, dedup, atomic claim, retry backoff, token pause, insights, disabled-account guard, queue tail, pages, routing, per-account claims, platform performa)`)
+console.log(`OK — ${n} assertions passed (crypto, kind migration, accounts, token refresh, dedup, atomic claim, retry backoff, token pause, insights, disabled-account guard, queue tail, pages, routing, per-account claims, platform performa, groups, routing across groups, per-account views)`)

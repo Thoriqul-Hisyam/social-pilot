@@ -119,7 +119,26 @@ Reverse proxy: lihat `deploy/nginx.conf`. Wajib meneruskan `X-Forwarded-For` —
 
 Buka `https://domain.com`, login, klik **Hubungkan akun** di bar atas lalu pilih platformnya. Untuk menambah akun kedua di platform yang sama, keluar dulu dari akun pertama di browser (threads.net, instagram.com), lalu hubungkan lagi.
 
-Akun yang terhubung tampil sebagai chip di bar atas. Klik chip untuk melihat masa berlaku token, menonaktifkan akun, dan memilih jenis post dari Hermes yang masuk otomatis lewat tombol **Berita** dan **Affiliate**. Akun lama menerima keduanya; akun baru juga, sampai diubah.
+Akun yang terhubung tampil sebagai chip di baris kedua bar atas, disusul pil grup. Klik chip untuk melihat masa berlaku token, menonaktifkan akun, dan memilih jenis post dari Hermes yang masuk otomatis lewat tombol **Berita** dan **Affiliate**. Akun lama menerima keduanya; akun baru juga, sampai diubah.
+
+**Grup akun.** Klik **+ Grup** di bar atas, lalu klik pil grupnya untuk memilih jenis post (Berita, Affiliate, atau semua jenis), mode, dan anggotanya. Satu akun boleh masuk banyak grup.
+
+- **Sama**: anggota grup memposting tiap item jenis itu bersama-sama, dengan caption, berita, atau produk yang sama.
+- **Beda**: tiap item jenis itu hanya diposting satu anggota grup, yaitu yang antreannya paling cepat kosong. Jadi anggotanya memposting berita atau produk berbeda, dan berita yang sudah pernah diposting salah satu anggota tidak diposting anggota lain.
+
+Semua grup berlaku sekaligus. Contoh dengan akun Threads 247, IG 247, FB Usaha Jaya, dan FB Media Internet:
+
+| Grup | Anggota | Jenis | Mode |
+|---|---|---|---|
+| A | Threads 247, FB Usaha Jaya | Affiliate | Beda |
+| B | Threads 247, IG 247 | Berita | Sama |
+| C | Threads 247, FB Media Internet | Berita | Beda |
+
+Hasilnya, tiap berita terbit di Threads + IG (grup B), atau di FB Media Internet (grup C), bergantian. Tiap produk terbit di Threads atau FB Usaha Jaya (grup A). Pembagian mengikuti antrean yang paling cepat kosong, jadi tidak selalu persis selang-seling: akun yang antreannya sudah panjang mendapat lebih sedikit.
+
+Anggota yang tidak menerima jenis itu (tombol Berita/Affiliate di akunnya) dilewati. Akun yang tidak ada di grup mana pun untuk jenis itu menerima semua item jenis itu, seperti sebelumnya. Menghapus grup tidak menghapus akunnya.
+
+**Tulis post** di bar atas membuka composer dalam pop-up; drafnya tetap ada kalau pop-up ditutup. Tab akun di bawah judul (**Semua akun** atau satu akun) mempersempit statistik, Performa, Antrean, Gagal, dan Riwayat ke akun itu.
 
 Buka dashboard lewat domain yang sama dengan `PUBLIC_APP_URL` / `THREADS_REDIRECT_URI`, bukan `localhost` atau IP. Callback hanya menerima akun kalau cookie login dan cookie `state` OAuth ikut kembali, dan cookie itu terikat ke domain. Kalau penukaran ke token 60 hari gagal, akun tidak disimpan.
 
@@ -136,7 +155,7 @@ curl -X POST https://domain.com/api/posts \
   -d '{"items":[{"caption":"...","imageUrl":"https://...","sourceUrl":"https://...","kind":"news"}]}'
 ```
 
-Item tanpa `accountId` masuk ke **semua akun aktif yang menerima jenisnya** (tombol Berita/Affiliate di chip akun pada bar atas), masing-masing di antrean akunnya sendiri. Item yang tidak cocok dengan akun mana pun dilewati dan nomornya ada di `no_target`. Item dengan `accountId` hanya masuk ke akun itu. `captions` opsional mengganti caption untuk platform tertentu, misalnya `"captions":{"instagram":"versi pendek…","facebook":"…"}`; platform tanpa versi sendiri memakai `caption` dan dipotong otomatis.
+Item tanpa `accountId` masuk ke akun aktif yang menerima jenisnya (tombol Berita/Affiliate di chip akun), sesuai grup jenis itu (lihat **Grup akun** di atas), masing-masing di antrean akunnya sendiri. Item yang tidak cocok dengan akun mana pun dilewati dan nomornya ada di `no_target`. Item dengan `accountId` hanya masuk ke akun itu, tanpa melihat grup. `captions` opsional mengganti caption untuk platform tertentu, misalnya `"captions":{"instagram":"versi pendek…","facebook":"…"}`; platform tanpa versi sendiri memakai `caption` dan dipotong otomatis.
 
 `kind` wajib di setiap item: `news` (berita, sertakan `sourceUrl` artikelnya) atau `affiliate`, persis huruf kecil. Item tanpa `kind` atau dengan nilai lain menolak seluruh batch (HTTP 400, `items_with_invalid_kind` menyebut nomor itemnya), dan tidak ada yang masuk antrean. `sourceUrl` berita yang sama tidak akan diantrekan dua kali ke akun yang sama (`skipped_duplicates`); affiliate boleh berulang. Tiap item butuh tepat satu `imageUrl` atau `videoUrl` (HTTPS publik). `scheduledAt` opsional (ISO, boleh dengan offset seperti `+07:00`; tanpa zona dianggap UTC). Satu item yang tidak valid menolak seluruh batch.
 
@@ -157,7 +176,7 @@ Insight performa (untuk dashboard dan crew):
 curl "https://domain.com/api/insights?days=7&kind=news&platform=instagram" -H "Authorization: Bearer $API_KEY"
 ```
 
-`days` 1–90 (default 7), `kind` dan `platform` (`threads`, `instagram`, `facebook`) opsional. Tanpa `platform`, angka semua platform dijumlahkan; views tiap platform dihitung berbeda, jadi bandingkan per platform. Hasilnya per jenis: `posts`, `covered` (post yang sudah terbaca), `errors` (post yang pembacaan terakhirnya gagal), `gone` (post yang sudah dihapus di Threads; tidak dibaca lagi dan tidak ikut di angka lain), total `views`/`likes`/`replies`/`reposts`/`quotes`/`shares`, `avg_views`, `avg_likes`, dan `engagement_rate` = (likes + replies + reposts + quotes + shares) / views. Ditambah `top` dan `bottom` (5 post, caption 120 karakter; `bottom` melewati post yang belum berumur sehari), serta `top_by_kind` dan `bottom_by_kind` per jenis. Angka diambil worker tick, 20 post per tick: post yang belum pernah terbaca lebih dulu (terbaru dulu, termasuk riwayat lama), lalu dibaca ulang tiap 3 jam di hari pertamanya dan tiap 12 jam sampai berumur seminggu. Pembacaan yang gagal dicoba lagi tiap jam sampai post berumur 30 hari. Kalau server tidak tersambung ke Threads, batch berhenti tanpa menandai post gagal dan dicoba lagi di tick berikutnya. Setelah akun dihubungkan ulang, riwayat lama butuh beberapa jam sampai terbaca semua; selama itu angka 30 hari masih didominasi post terbaru. Untuk chain, yang dibaca post akarnya; balasan tidak dijumlahkan Threads.
+`days` 1–90 (default 7), `kind`, `platform` (`threads`, `instagram`, `facebook`), dan `account` (id akun) opsional. Tanpa `platform`, angka semua platform dijumlahkan; views tiap platform dihitung berbeda, jadi bandingkan per platform. Hasilnya per jenis: `posts`, `covered` (post yang sudah terbaca), `errors` (post yang pembacaan terakhirnya gagal), `gone` (post yang sudah dihapus di Threads; tidak dibaca lagi dan tidak ikut di angka lain), total `views`/`likes`/`replies`/`reposts`/`quotes`/`shares`, `avg_views`, `avg_likes`, dan `engagement_rate` = (likes + replies + reposts + quotes + shares) / views. Ditambah `top` dan `bottom` (5 post, caption 120 karakter; `bottom` melewati post yang belum berumur sehari), serta `top_by_kind` dan `bottom_by_kind` per jenis. Angka diambil worker tick, 20 post per tick: post yang belum pernah terbaca lebih dulu (terbaru dulu, termasuk riwayat lama), lalu dibaca ulang tiap 3 jam di hari pertamanya dan tiap 12 jam sampai berumur seminggu. Pembacaan yang gagal dicoba lagi tiap jam sampai post berumur 30 hari. Kalau server tidak tersambung ke Threads, batch berhenti tanpa menandai post gagal dan dicoba lagi di tick berikutnya. Setelah akun dihubungkan ulang, riwayat lama butuh beberapa jam sampai terbaca semua; selama itu angka 30 hari masih didominasi post terbaru. Untuk chain, yang dibaca post akarnya; balasan tidak dijumlahkan Threads.
 
 Daftar akun dan routing-nya (hanya baca; mengubahnya tetap dari dashboard):
 
@@ -165,7 +184,7 @@ Daftar akun dan routing-nya (hanya baca; mengubahnya tetap dari dashboard):
 curl https://domain.com/api/accounts -H "Authorization: Bearer $API_KEY"
 ```
 
-Hasilnya `accounts[]` (`id`, `platform`, `username`, `enabled`, `auto_news`, `auto_affiliate`, `token_expires_at`, `token_invalid_at`; token tidak pernah ikut) dan `platforms[]` (platform yang bisa dihubungkan beserta env yang masih kurang). `token_invalid_at` terisi berarti antrean akun itu dijeda.
+Hasilnya `accounts[]` (`id`, `platform`, `username`, `enabled`, `auto_news`, `auto_affiliate`, `token_expires_at`, `token_invalid_at`; token tidak pernah ikut), `groups[]` (`id`, `name`, `kind`: `news`, `affiliate` atau `all`, `mode`: `same` atau `split`, `account_ids`), dan `platforms[]` (platform yang bisa dihubungkan beserta env yang masih kurang). `token_invalid_at` terisi berarti antrean akun itu dijeda. Grup hanya bisa diubah dari dashboard.
 
 Hapus post:
 

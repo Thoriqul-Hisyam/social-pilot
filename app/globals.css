@@ -26,8 +26,12 @@ header{flex-wrap:wrap;gap:16px}.header-controls{display:flex;gap:10px;align-item
 .perf-controls{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 @media(max-width:600px){.perf-controls{justify-content:flex-start;width:100%}.perf-controls .kind-filter{flex-wrap:wrap;max-width:100%}}
 /* accounts in the top bar */
-.topbar-right{display:flex;align-items:center;gap:10px;min-width:0}
-.acct-strip{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+/* Two rows: brand and actions, then the accounts, which may wrap without squeezing the buttons. */
+.topbar-inner{flex-wrap:wrap;row-gap:8px}
+.topbar-right{display:contents}
+.topbar nav{order:2;margin-left:auto}
+.topbar nav a,.topbar nav button,.connect-menu summary{white-space:nowrap}
+.acct-strip{order:3;width:100%;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .acct{position:relative}
 .acct summary{list-style:none;display:inline-flex;align-items:center;gap:7px;height:34px;padding:0 10px 0 6px;border:1px solid #e4e7ee;border-radius:7px;background:#fff;font-size:12px;color:#344054;cursor:pointer}
 .acct summary::-webkit-details-marker{display:none}
@@ -36,13 +40,39 @@ header{flex-wrap:wrap;gap:16px}.header-controls{display:flex;gap:10px;align-item
 .acct.off summary{opacity:.5}
 .acct.bad summary{border-color:#f5c6c6;background:#fdecec}
 .acct .alert{width:7px;height:7px;border-radius:50%;background:#c0392b}
-.acct-menu{position:absolute;right:0;top:40px;width:260px;background:#fff;border:1px solid #e4e7ee;border-radius:9px;box-shadow:0 8px 24px #1d2a4420;padding:13px 14px;z-index:10}
+.acct-menu{position:absolute;left:0;top:40px;width:260px;background:#fff;border:1px solid #e4e7ee;border-radius:9px;box-shadow:0 8px 24px #1d2a4420;padding:13px 14px;z-index:10}
 .acct-menu b{font-size:13px}
 .acct-menu small{display:block;color:#9198a8;margin-top:4px;font-size:11px}
 .acct-menu small.token-warn{color:#c0392b}
 .acct-hint{margin:12px 0 0;font-size:11px;color:#8c94a4}
 .acct-foot{display:flex;align-items:center;gap:8px;margin-top:12px;padding-top:10px;border-top:1px solid #eff0f4}
 .acct-foot a{font-size:12px;color:#c0392b;font-weight:600}
-.composer-full{margin-bottom:19px}
-@media(max-width:1100px){.acct .label{display:none}.acct summary{padding:0 5px}}
-@media(max-width:600px){.topbar-right{gap:6px}.acct-strip{gap:4px}.acct-menu{position:fixed;left:15px;right:15px;top:56px;width:auto}}
+@media(max-width:600px){.acct .label{display:none}.acct summary{padding:0 5px}}
+/* write button, groups, account tabs, composer dialog */
+.topbar nav button.write{background:#6956df;color:#fff;border-color:transparent;font-weight:600}
+.topbar nav button.write:hover{background:#5a47d0}
+.acct.grp summary{border:0;background:#f4f2ff;color:#6856db;font-weight:600;padding:0 8px;gap:6px}
+.mode{font-size:10px;font-weight:600;padding:1px 6px;border-radius:8px;background:#fff;color:#6856db}
+.mode.split{background:#fff2e8;color:#b45f1c}
+.route.mode-pick.on{background:#efedff;color:#6754da;border:1px solid transparent;font-weight:600}
+.acct-note{margin:8px 0 0;font-size:11px;line-height:1.45;color:#667084}
+.grp-members{display:inline-flex;gap:2px}
+.grp-members .pf,.grp-pick .pf{width:18px;height:18px;font-size:9px;border-radius:5px}
+.grp-pick{display:grid;gap:2px;margin-top:6px}
+.grp-pick label{display:flex;align-items:center;gap:7px;padding:4px 2px;font-size:12px;color:#263148;cursor:pointer}
+.acct-menu .grp-pick small{display:inline;margin:0 0 0 auto}
+.strip-sep{width:1px;height:22px;background:#e4e7ee;margin:0 4px}
+.add-group{display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 10px;border:1px dashed #cfd3dd;border-radius:7px;background:#fff;color:#6856db;font-size:12px;font-weight:600}
+.add-group:hover{border-color:#a69bef}
+.acct-foot.split{justify-content:space-between}
+.acct-foot.split .ghost.small{margin-left:0}
+.scope-tabs{display:flex;flex-wrap:wrap;width:fit-content;max-width:100%;margin:-14px 0 20px}
+.scope-tabs button{display:inline-flex;align-items:center;gap:6px}
+.scope-tabs .pf{width:18px;height:18px;font-size:9px;border-radius:5px}
+.scope-name{font-weight:500;color:#8c94a4;font-size:13px}
+.composer-dialog{padding:0;border:0;background:transparent;width:min(760px,calc(100vw - 32px));max-width:none;max-height:calc(100vh - 32px);overflow:auto}
+.composer-dialog::backdrop{background:#1d2a4466;backdrop-filter:blur(2px)}
+.composer-dialog .card{box-shadow:0 20px 50px #1d2a4433}
+.composer-dialog h2{display:flex;align-items:center;gap:6px}
+@media(max-width:900px){.acct-menu{position:fixed;left:15px;right:15px;top:100px;width:auto;max-height:calc(100vh - 120px);overflow:auto}}
+@media(max-width:600px){.acct-strip{gap:4px}.composer-foot .platforms{flex-wrap:wrap;justify-content:flex-start}}

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { type Account, isPostKind, pagePosts, type PostKind, queuePost, queueTail, routeTargets, stats, listAccounts, toSqlTime } from '@/lib/db'
+import { type Account, groupsFor, isPostKind, listAccounts, newsQueuedIn, pagePosts, type PostKind, queuePost, queueTail, routeTargets, stats, toSqlTime } from '@/lib/db'
+import { pickAccounts } from '@/lib/routing'
 import { hasValidApiKey, hasValidSession, unauthorized } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -35,7 +36,8 @@ const MAX_PAGE_SIZE = 100
 
 /**
  * ?view=queue|failed|history (else all), ?kind=news|affiliate (else both),
- * ?page from 1 and ?limit up to 100. Stats follow the kind filter.
+ * ?account=<id> (else every account), ?page from 1 and ?limit up to 100.
+ * Stats follow the kind and account filters.
  */
 export async function GET(request: NextRequest) {
   if (!hasValidSession(request)) return unauthorized()
@@ -43,26 +45,37 @@ export async function GET(request: NextRequest) {
   const kind = q.get('kind') || null
   if (kind !== null && !isPostKind(kind))
     return NextResponse.json({ error: 'kind must be news or affiliate' }, { status: 400 })
+  const account = q.get('account') ? Number(q.get('account')) : null
+  if (account !== null && !Number.isInteger(account))
+    return NextResponse.json({ error: 'account must be an account id' }, { status: 400 })
   const view = q.get('view')
   const limit = Math.min(Math.max(Math.floor(Number(q.get('limit'))) || MAX_PAGE_SIZE, 1), MAX_PAGE_SIZE)
   const page = Math.max(Math.floor(Number(q.get('page'))) || 1, 1)
   const { posts, total } = pagePosts(
     view === 'queue' || view === 'failed' || view === 'history' ? view : 'all',
-    { kind, limit, offset: (page - 1) * limit },
+    { kind, accountId: account, limit, offset: (page - 1) * limit },
   )
-  return NextResponse.json({ posts, total, page, limit, stats: stats(kind) })
+  return NextResponse.json({ posts, total, page, limit, stats: stats(kind, account) })
+}
+
+type Item = {
+  index: number; caption: string; captions: Record<string, unknown>; kind: PostKind
+  media: { image_url: string | null; video_url: string | null }; source_url: string | null
+  scheduledAt: string | null; label: string; account: Account | null
 }
 
 /**
- * Queue one or many posts. An item with accountId goes to that account; one
- * without goes to every enabled account set to take its kind (auto_news,
- * auto_affiliate), and is reported in no_target when none does.
+ * Queue one or many posts. An item with accountId goes to that account. One
+ * without goes to the enabled accounts that take its kind (auto_news,
+ * auto_affiliate), as the groups of that kind allow (lib/routing.ts): a same
+ * group's members post it together, a split group's members never both do.
+ * An item no account takes is reported in no_target.
  * Each account keeps its own rhythm: its posts are staggered by a random
  * 5-30 min gap after its latest pending slot, so a batch never fires all at once.
  * Every item needs kind "news" or "affiliate"; one without rejects the batch.
  * captions: {instagram: "...", facebook: "..."} optionally replaces caption on those platforms.
- * Duplicate news sourceUrl for the same account is skipped, not an error;
- * affiliate may repeat.
+ * Duplicate news sourceUrl for the same account is skipped, not an error, and a
+ * split group never posts the same article twice; affiliate may repeat.
  */
 export async function POST(request: NextRequest) {
   if (!hasValidApiKey(request) && !hasValidSession(request)) return unauthorized()
@@ -93,23 +106,16 @@ export async function POST(request: NextRequest) {
       items_with_invalid_kind: badKind,
     }, { status: 400 })
 
-  const posts = []
-  const noTarget: number[] = []
-  for (const [i, raw] of items.entries()) {
+  const valid: Item[] = []
+  for (const [index, raw] of items.entries()) {
     const it = raw as Record<string, unknown>
     const caption = typeof it.caption === 'string' ? it.caption.trim() : ''
     if (!caption) return NextResponse.json({ error: 'caption required for every item' }, { status: 400 })
-    const captions = it.captions && typeof it.captions === 'object' ? it.captions as Record<string, unknown> : {}
-    const kind = it.kind as PostKind
 
-    let targets: Account[]
+    let account: Account | null = null
     if (it.accountId != null) {
-      const account = accounts.find(a => a.id === it.accountId)
+      account = accounts.find(a => a.id === it.accountId) ?? null
       if (!account) return NextResponse.json({ error: `account ${it.accountId} not found` }, { status: 400 })
-      targets = [account]
-    } else {
-      targets = routeTargets(kind)
-      if (!targets.length) { noTarget.push(i); continue }
     }
 
     // Caller may pin scheduled_at (e.g. a migration script with already-due articles):
@@ -119,36 +125,48 @@ export async function POST(request: NextRequest) {
     if (pinned && !scheduledAt)
       return NextResponse.json({ error: `scheduledAt is not a valid date: ${pinned}` }, { status: 400 })
 
-    for (const account of targets) {
-      const own = captions[account.platform]
-      posts.push({
-        account_id: account.id,
-        caption: typeof own === 'string' && own.trim() ? own.trim() : caption,
-        ...mediaOf(it)!,
-        source_url: typeof it.sourceUrl === 'string' ? it.sourceUrl : null,
-        kind,
-        scheduledAt,
-        label: String(it.sourceUrl ?? caption.slice(0, 40)),
-      })
-    }
+    valid.push({
+      index, caption, kind: it.kind as PostKind, media: mediaOf(it)!, account, scheduledAt,
+      captions: it.captions && typeof it.captions === 'object' ? it.captions as Record<string, unknown> : {},
+      source_url: typeof it.sourceUrl === 'string' ? it.sourceUrl : null,
+      label: String(it.sourceUrl ?? caption.slice(0, 40)),
+    })
   }
 
+  // Where each account's next slot goes from; it moves on with every post queued on it.
   const cursors = new Map<number, number>()
+  const tail = (id: number) => {
+    if (!cursors.has(id)) cursors.set(id, queueTail(MAX_GAP_MIN * 60_000, id))
+    return cursors.get(id)!
+  }
   const queued: number[] = []
+  const noTarget: number[] = []
   // Labels stay as before, one per item, even when only some of its accounts had it already.
   const skipped = new Set<string>()
 
-  for (const { scheduledAt, label, ...post } of posts) {
-    let at = scheduledAt
+  const queueOn = (it: Item, account: Account) => {
+    let at = it.scheduledAt
     if (!at) {
-      const cursor = (cursors.get(post.account_id) ?? queueTail(MAX_GAP_MIN * 60_000, post.account_id))
-        + (MIN_GAP_MIN + Math.random() * (MAX_GAP_MIN - MIN_GAP_MIN)) * 60_000
-      cursors.set(post.account_id, cursor)
+      const cursor = tail(account.id) + (MIN_GAP_MIN + Math.random() * (MAX_GAP_MIN - MIN_GAP_MIN)) * 60_000
+      cursors.set(account.id, cursor)
       at = toSqlTime(cursor)
     }
-    const id = queuePost({ ...post, scheduled_at: at })
-    if (id === null) skipped.add(label)
+    const own = it.captions[account.platform]
+    const id = queuePost({
+      account_id: account.id, caption: typeof own === 'string' && own.trim() ? own.trim() : it.caption,
+      ...it.media, source_url: it.source_url, kind: it.kind, scheduled_at: at,
+    })
+    if (id === null) skipped.add(it.label)
     else queued.push(id)
+  }
+
+  for (const it of valid) {
+    if (it.account) { queueOn(it, it.account); continue }
+    const targets = routeTargets(it.kind)
+    if (!targets.length) { noTarget.push(it.index); continue }
+    const url = it.kind === 'news' ? it.source_url : null
+    const picked = pickAccounts(targets.map(a => a.id), groupsFor(it.kind), tail, id => !!url && newsQueuedIn([id], url))
+    for (const a of targets) if (picked.includes(a.id)) queueOn(it, a)
   }
 
   return NextResponse.json({ queued: queued.length, ids: queued, skipped_duplicates: [...skipped], no_target: noTarget })
